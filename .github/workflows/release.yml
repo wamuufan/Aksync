@@ -1,16 +1,6 @@
 name: Build and Release (Linux x86_64 tar.gz)
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    tags:
-      - "v*"
-  pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
 permissions:
@@ -21,7 +11,7 @@ env:
 
 jobs:
   build-linux:
-    name: Build & Test AkSync (Ubuntu x86_64)
+    name: Build & Release AkSync #${{ github.run_number }}
     runs-on: ubuntu-24.04
 
     steps:
@@ -81,18 +71,11 @@ jobs:
           tar -czvf aksync-linux-x86_64.tar.gz -C dist-pkg "${PKG_DIR}"
           sha256sum aksync-linux-x86_64.tar.gz > aksync-linux-x86_64.tar.gz.sha256
 
-      - name: Upload Build Artifact to Workflow Run
-        uses: actions/upload-artifact@v4
-        with:
-          name: aksync-linux-x86_64
-          path: |
-            aksync-linux-x86_64.tar.gz
-            aksync-linux-x86_64.tar.gz.sha256
-
-      - name: Publish to GitHub Releases (on Tag Push v*)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish to GitHub Releases (Sequential systemd-style Release)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ github.run_number }}
+          name: AkSync v${{ github.run_number }}
           generate_release_notes: true
           files: |
             aksync-linux-x86_64.tar.gz
