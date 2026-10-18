@@ -1,0 +1,99 @@
+name: Build and Release (Linux x86_64 tar.gz)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build & Test AkSync (Ubuntu x86_64)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux System Dependencies (FUSE3, WebKit2GTK, GTK3, Ayatana)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libfuse3-dev \
+            fuse3 \
+            rclone \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install Rust Toolchain (stable + wasm32-unknown-unknown)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache Cargo Registry and Build Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk (WASM Bundler)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Build Leptos WASM Frontend via Trunk
+        working-directory: crates/mycloud-gui
+        run: trunk build --config Trunk.toml --release
+
+      - name: Run Workspace Unit & Integration Tests
+        run: cargo test --workspace
+
+      - name: Build Release Binaries (mycloud-daemon, mycloud-fuse, mycloud-gui)
+        run: cargo build --workspace --release
+
+      - name: Package Release Archive (aksync-linux-x86_64.tar.gz)
+        run: |
+          PKG_DIR="aksync-linux-x86_64"
+          mkdir -p "dist-pkg/${PKG_DIR}"
+          cp target/release/mycloud-daemon "dist-pkg/${PKG_DIR}/"
+          cp target/release/mycloud-fuse   "dist-pkg/${PKG_DIR}/"
+          cp target/release/mycloud-gui    "dist-pkg/${PKG_DIR}/"
+          cp LICENSE README.md INSTALLATION.md HOW-TO-BUILD.md "dist-pkg/${PKG_DIR}/"
+          tar -czvf aksync-linux-x86_64.tar.gz -C dist-pkg "${PKG_DIR}"
+          sha256sum aksync-linux-x86_64.tar.gz > aksync-linux-x86_64.tar.gz.sha256
+
+      - name: Upload Build Artifact to Workflow Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: aksync-linux-x86_64
+          path: |
+            aksync-linux-x86_64.tar.gz
+            aksync-linux-x86_64.tar.gz.sha256
+
+      - name: Publish to GitHub Releases (on Tag Push v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            aksync-linux-x86_64.tar.gz
+            aksync-linux-x86_64.tar.gz.sha256

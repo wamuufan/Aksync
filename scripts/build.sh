@@ -7,7 +7,7 @@ set -euo pipefail
 export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PKG_CONFIG_PATH="/home/user-0/.pkgconfig:${ROOT_DIR}/.pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PKG_CONFIG_PATH="${HOME}/.pkgconfig:${ROOT_DIR}/.pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 # ANSI Colors
 GREEN='\033[0;32m'
