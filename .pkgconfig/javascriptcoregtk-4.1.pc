@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: javascriptcoregtk-4.1
+Description: JavaScriptCore for WebKitGTK
+Version: 2.42.0
+Requires: glib-2.0
+Libs: -L${libdir}
+Cflags:

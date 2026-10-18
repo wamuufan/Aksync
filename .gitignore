@@ -1,0 +1,94 @@
+# ==============================================================================
+# AkSync — Git Ignore Configuration
+# ==============================================================================
+
+# 1. Rust & Cargo Build Artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bk
+__pycache__/
+*.pyc
+*.pyo
+
+# 2. Local Cargo Environment & Machine-Specific Overrides
+# (Contains local pkg-config paths / host-specific flags)
+/.cargo/config.toml
+/.cargo/config
+
+# 3. Frontend (Leptos / Trunk / WASM / Web) Build Outputs
+/crates/mycloud-gui/dist/
+/crates/mycloud-gui/dist-ssr/
+/crates/mycloud-gui/.trunk/
+**/dist/
+**/dist-ssr/
+**/.trunk/
+**/node_modules/
+*.wasm
+
+# 4. Tauri Generated Files & Bundles
+/crates/mycloud-gui/src-tauri/gen/schemas
+/crates/mycloud-gui/src-tauri/WixTools/
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+
+# 5. Secrets, Credentials, OAuth Tokens & Cryptographic Keys (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.htpasswd
+webdav.htpasswd
+rclone.conf
+*client_secret*.json
+*credentials*.json
+*.recovery
+*.vault
+.aksync_diriv
+*.name
+
+# 6. Runtime Sockets, Mount Directories, Caches & Logs
+*.sock
+*.pid
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+/logs/
+/raw_vault/
+/vault/
+/cache/
+/tmp/
+/scratch/
+/preview/
+/.pkgconfig/lib/
+
+# 7. Editor, IDE & OS Metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*.local
+/.vscode/
+/.idea/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln

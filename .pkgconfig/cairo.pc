@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: cairo
+Description: Cairo
+Version: 1.17.6
+Libs: -L${libdir} -lcairo
+Cflags:

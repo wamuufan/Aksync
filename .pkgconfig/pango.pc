@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: pango
+Description: Pango
+Version: 1.50.0
+Requires: gobject-2.0
+Libs: -L${libdir} -lpango-1.0
+Cflags:

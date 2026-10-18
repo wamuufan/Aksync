@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: webkit2gtk-4.1
+Description: WebKitGTK
+Version: 2.42.0
+Requires: gtk+-3.0 soup-3.0 javascriptcoregtk-4.1
+Libs: -L${libdir}
+Cflags:

@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: cairo-gobject
+Description: Cairo GObject
+Version: 1.17.6
+Requires: cairo gobject-2.0
+Libs: -L${libdir} -lcairo-gobject
+Cflags:

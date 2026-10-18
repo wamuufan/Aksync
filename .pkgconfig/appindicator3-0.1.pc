@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=/home/user-0/Şablonlar/AkSync/.pkgconfig/lib
+includedir=/usr/include
+
+Name: appindicator3-0.1
+Description: Application Indicators library
+Version: 12.10.1
+Libs: -L${libdir} -lappindicator3
+Cflags: -I${includedir}

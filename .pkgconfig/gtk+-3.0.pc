@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: gtk+-3.0
+Description: GTK+
+Version: 3.24.38
+Requires: gdk-3.0 gio-2.0 atk
+Libs: -L${libdir} -lgtk-3
+Cflags:

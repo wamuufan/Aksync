@@ -1,0 +1,26 @@
+[package]
+name = "mycloud-gui"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[lib]
+name = "mycloud_gui_lib"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mycloud-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", default-features = false , features = [] }
+
+[dependencies]
+tauri = { version = "2", default-features = false, features = ["tray-icon", "compression", "dynamic-acl", "wry", "image-png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

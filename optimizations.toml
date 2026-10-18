@@ -1,0 +1,109 @@
+# ==============================================================================
+# MyCloud (AkSync) - Derleme Aşaması Optimizasyon ve Yapılandırma Dosyası
+# ==============================================================================
+# Bu dosya, `cargo build` çalıştırıldığında derleme aşamasında doğrudan binary'nin
+# içine gömülür (embedded). Böylece kaynak kod içindeki tüm ayarlar merkezi,
+# anlaşılır ve kolay düzenlenebilir bir formatta toplanmış olur.
+# ==============================================================================
+
+[vfs]
+# VFS önbellek modu: "off" | "minimal" | "writes" | "full"
+# "writes", yerel dosya yazmalarını anında kabul edip arka planda güvenle yükler.
+cache_mode = "writes"
+
+# Maksimum disk önbellek boyutu (örn. "1G", "5G", "10G")
+cache_max_size = "1G"
+
+# Önbellekteki dosyaların son erişimden sonra saklanacağı maksimum süre
+cache_max_age = "1h"
+
+# Okuma parçası boyutu ve limiti
+read_chunk_size = "128k"
+read_chunk_size_limit = "64M"
+
+# VFS okuma ön yükleme (read-ahead) tamponu
+read_ahead = "128k"
+
+# Rclone soket ve bellek tampon boyutu
+buffer_size = "128k"
+
+[cache]
+# Dizin ağacının RAM'de tutulma süresi.
+# "24h", Dolphin'in her F5 veya klasör tıklamasında internete gitmesini önler, 0ms anında yanıt verir.
+dir_cache_time = "24h"
+
+# Dosya özniteliklerinin (boyut, tarih) RAM'de geçerli kalma süresi.
+attr_timeout = "24h"
+
+# Google Drive üzerindeki değişikliklerin taranma aralığı (Google Drive Changes API).
+poll_interval = "1m"
+
+[network]
+# Rclone ağ zaman aşımları ve yeniden deneme ayarları
+timeout = "30s"
+contimeout = "10s"
+low_level_retries = 3
+retries = 3
+
+# Google Drive API istekleri arasındaki asgari uyku süresi
+drive_pacer_min_sleep = "200ms"
+
+# Google Drive API ani istek patlama kotası (burst)
+drive_pacer_burst = 10
+
+# Dosya transferlerinde sağlama toplamı hesaplama süresini atlayarak CPU/ağ tasarrufu yap
+no_checksum = true
+
+# Rclone RC HTTP istek zaman aşımı (saniye)
+http_timeout_secs = 3
+
+# Google Drive kota sorgusu (operations/about) zaman aşımı (saniye)
+about_timeout_secs = 30
+
+# Bulut depolama kotasının arka planda kaç saniyede bir güncelleneceği (varsayılan: 300 saniye / 5 dakika)
+about_refresh_interval_secs = 300
+
+# Rclone RC API hazır olma bekleme zaman aşımı (saniye)
+rc_ready_timeout_secs = 60
+
+# Rclone RC hazır olma kontrolü yeniden deneme aralığı (milisaniye)
+rc_ready_retry_ms = 250
+
+[sync]
+# Otomatik klasör eşitleme periyodu (saniye cinsinden, varsayılan: 30 saniye)
+home_sync_interval_secs = 30
+
+# GUI arayüzündeki hız ve transfer istatistiklerinin güncelleme sıklığı (milisaniye, varsayılan: 1000ms)
+stats_interval_ms = 1000
+
+# Rclone eşitleme sırasında aynı anda çalıştırılacak eşzamanlı dosya transferi sayısı
+transfers = 4
+
+# Yeni kurulumlarda gizli dosyaların (noktayla başlayanlar) varsayılan olarak eşitlenip eşitlenmeyeceği
+default_sync_hidden_files = false
+
+[process]
+# Uygulama kapatılırken alt süreçlerin (rclone, WebDAV, FUSE) normal sonlanması için tanınan süre (saniye)
+# Bu sürede kapanmazsa güvenli bir şekilde SIGKILL gönderilir.
+sigterm_timeout_secs = 3
+
+# Google Drive düz WebDAV yerel adresi
+webdav_bind_addr = "127.0.0.1:8765"
+
+# Şifrelenmiş MyCloud kasası WebDAV yerel adresi
+vault_webdav_bind_addr = "127.0.0.1:8766"
+
+# rclone RC API dinleme adresi
+rc_bind_addr = "127.0.0.1:5572"
+
+# Vault WebDAV rclone RC API dinleme adresi
+vault_rc_bind_addr = "127.0.0.1:5573"
+
+[features]
+# Uygulama açılışında klasör ağacını RAM'e önceden yükle (pre-warm)
+# İlk tıklamalardaki bekleme süresini ("Yükleniyor...") tamamen ortadan kaldırır.
+enable_vfs_prewarm = true
+
+# Dolphin için .nomedia ve .directory kilitlenme önleme kurallarını uygula
+# Arka planda 5-10 tane thumbnail.so worker'ının dosya indirip sistemi kitlemesini engeller.
+enable_freeze_prevention = true

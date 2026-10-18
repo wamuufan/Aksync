@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mycloud-crypto",
+    "crates/mycloud-fuse",
+    "crates/mycloud-daemon",
+    "crates/mycloud-gui",
+    "crates/mycloud-gui/src-tauri",
+]
+
+# ==============================================================================
+# Profil ve Disk Optimizasyonları
+# ==============================================================================
+
+# Geliştirme (debug) profili: Kendi kodumuz için hafif debug (satır bilgisi)
+[profile.dev]
+debug = 1
+
+# Dış bağımlılıkların devasa debug sembollerini (DWARF) kapatıp kodları optimize eder.
+# Bu ayar disk kullanımını %70-%80 oranında düşürür ve linkleme süresini ciddi hızlandırır.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+# Sürüm (release) profili: Maksimum sıkıştırma ve sembol temizliği
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+

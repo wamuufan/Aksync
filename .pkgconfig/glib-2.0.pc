@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: glib-2.0
+Description: GLib
+Version: 2.78.0
+Libs: -L${libdir} -lglib-2.0
+Cflags:

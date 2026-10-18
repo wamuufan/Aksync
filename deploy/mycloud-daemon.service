@@ -1,0 +1,17 @@
+[Unit]
+Description=MyCloud End-to-End Encrypted Cloud Synchronization Daemon
+Documentation=https://github.com/mycloud/mycloud
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mycloud-daemon
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

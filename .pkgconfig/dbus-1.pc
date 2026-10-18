@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: dbus-1
+Description: D-Bus
+Version: 1.14.0
+Libs: -L${libdir} -ldbus-1
+Cflags:

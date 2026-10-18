@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=/home/user-0/Şablonlar/AkSync/.pkgconfig/lib
+includedir=/usr/include
+
+Name: ayatana-appindicator3-0.1
+Description: Ayatana Application Indicators library
+Version: 0.5.92
+Libs: -L${libdir} -layatana-appindicator3
+Cflags: -I${includedir}

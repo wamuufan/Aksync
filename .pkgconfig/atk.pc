@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: atk
+Description: ATK
+Version: 2.38.0
+Requires: gobject-2.0
+Libs: -L${libdir} -latk-1.0
+Cflags:

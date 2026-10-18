@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: gdk-3.0
+Description: GDK
+Version: 3.24.38
+Requires: pango cairo gdk-pixbuf-2.0
+Libs: -L${libdir} -lgdk-3
+Cflags:

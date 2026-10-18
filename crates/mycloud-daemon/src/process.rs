@@ -1,0 +1,1585 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::process::{Child, Command};
+use tokio::time::sleep;
+use sha1::{Digest, Sha1};
+use tracing::{info, warn};
+
+#[derive(Error, Debug)]
+pub enum ProcessError {
+    #[error("Failed to spawn subprocess '{name}': {source}")]
+    SpawnFailed {
+        name: &'static str,
+        source: std::io::Error,
+    },
+
+    #[error("Subprocess '{0}' exited prematurely")]
+    ProcessExited(&'static str),
+
+    #[error("Rclone RC API readiness check timed out after {0:?}")]
+    RcReadinessTimeout(Duration),
+
+    #[error("Mount at {path:?} timed out after {timeout:?}")]
+    MountTimeout {
+        path: PathBuf,
+        timeout: Duration,
+    },
+
+    #[error("Reqwest HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Recursively counts all files inside the specified directory
+fn count_files_in_dir(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_file() || ft.is_symlink() {
+                    total += 1;
+                } else if ft.is_dir() {
+                    total += count_files_in_dir(&entry.path());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Lazily unmounts a path using fusermount3 / fusermount to cleanly release any stale FUSE mounts
+pub fn unmount_path_lazy(path: &Path) {
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg("-z")
+        .arg(path)
+        .output();
+    let _ = std::process::Command::new("fusermount")
+        .arg("-u")
+        .arg("-z")
+        .arg(path)
+        .output();
+}
+
+/// Prepares a mountpoint directory, ensuring it is unmounted and completely empty.
+/// This prevents rclone and FUSE mounts from failing when --allow-non-empty is disabled.
+pub fn prepare_empty_mountpoint(path: &Path) -> Result<(), std::io::Error> {
+    // 1. Unmount any dangling mount
+    unmount_path_lazy(path);
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 2. Double-check if still in mountinfo
+    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+        if is_mountpoint_ready(&mountinfo, path, "fuse") {
+            warn!("Mountpoint {:?} still reported mounted, issuing second unmount", path);
+            unmount_path_lazy(path);
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+        return Ok(());
+    }
+
+    // 3. Confirm path is NOT mounted before touching any file inside it
+    let is_mounted = std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|info| is_mountpoint_ready(&info, path, "fuse"))
+        .unwrap_or(false);
+
+    if is_mounted {
+        warn!("Cannot clean mountpoint {:?}: still actively mounted in kernel", path);
+        return Ok(());
+    }
+
+    // 4. Safe to clean stale unmounted files (like leftover .nomedia, .directory)
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            info!("Removing stale file from unmounted mount point {:?}: {:?}", path, child);
+            if child.is_dir() {
+                let _ = std::fs::remove_dir_all(&child);
+            } else {
+                let _ = std::fs::remove_file(&child);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensures KDE Places / Solid assigns the 'folder-cloud' icon to the mount point
+/// Derives the device-specific vault folder name from USER and HOSTNAME (e.g. MyCloud_alice_workstation)
+pub fn get_device_vault_folder() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| {
+            let mut buf = [0u8; 64];
+            unsafe {
+                if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
+                    std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    "device".to_string()
+                }
+            }
+        });
+    format!("MyCloud_{}_{}", user, host)
+}
+
+/// Ensures an address string binds strictly to localhost (127.0.0.1)
+pub fn ensure_localhost_addr(addr: &str) -> String {
+    if let Some((_host, port)) = addr.rsplit_once(':') {
+        format!("127.0.0.1:{}", port)
+    } else {
+        format!("127.0.0.1:{}", addr)
+    }
+}
+
+/// Unescapes octal sequences (e.g. \040 -> space) generated by Linux kernel in /proc/self/mountinfo
+pub fn unescape_octal(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut octal = String::new();
+            for _ in 0..3 {
+                if let Some(&next_c) = chars.peek() {
+                    if next_c.is_digit(8) {
+                        octal.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if octal.len() == 3 {
+                if let Ok(byte) = u8::from_str_radix(&octal, 8) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('\\');
+            result.push_str(&octal);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Checks whether target_path is mounted with a filesystem type matching fstype_prefix in /proc/self/mountinfo
+pub fn is_mountpoint_ready(mountinfo_content: &str, target_path: &Path, fstype_prefix: &str) -> bool {
+    let canonical_target = target_path.canonicalize().ok();
+    for line in mountinfo_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // mountinfo format:
+        // 0: mount ID, 1: parent ID, 2: major:minor, 3: root, 4: mount point, 5: mount options
+        // ... optional fields ... separator "-" ... fstype
+        if parts.len() < 7 {
+            continue;
+        }
+
+        let mount_point = unescape_octal(parts[4]);
+        let mp_path = Path::new(&mount_point);
+
+        let matches_path = mp_path == target_path
+            || canonical_target.as_ref().map(|ct| ct == mp_path).unwrap_or(false)
+            || mp_path.canonicalize().map(|mp_c| mp_c == target_path || canonical_target.as_ref() == Some(&mp_c)).unwrap_or(false);
+
+        if !matches_path {
+            continue;
+        }
+
+        if let Some(dash_idx) = parts.iter().position(|&p| p == "-") {
+            if dash_idx + 1 < parts.len() {
+                let fstype = parts[dash_idx + 1];
+                if fstype.starts_with(fstype_prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Awaits until target_path appears in /proc/self/mountinfo with a filesystem starting with fstype_prefix
+pub async fn wait_for_mount(
+    path: &Path,
+    fstype_prefix: &str,
+    timeout: Duration,
+    retry_interval: Duration,
+) -> Result<(), ProcessError> {
+    let start = tokio::time::Instant::now();
+    info!(
+        "Awaiting mount readiness at {:?} with fstype prefix '{}' (timeout: {:?})",
+        path, fstype_prefix, timeout
+    );
+
+    while start.elapsed() < timeout {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
+            if is_mountpoint_ready(&content, path, fstype_prefix) {
+                info!("Mount point at {:?} is confirmed ready", path);
+                return Ok(());
+            }
+        }
+        sleep(retry_interval).await;
+    }
+
+    Err(ProcessError::MountTimeout {
+        path: path.to_path_buf(),
+        timeout,
+    })
+}
+
+/// Registers the WebDAV flat network drive and MyCloud Vault in KDE Dolphin Places cleanly under Uzak Konum
+pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr: &str) {
+    if let Ok(home) = std::env::var("HOME") {
+        let xbel_path = PathBuf::from(&home).join(".local/share/user-places.xbel");
+        if !xbel_path.exists() {
+            return;
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&xbel_path) {
+            let orig_len = content.len();
+            let mut cleaned = content;
+            let stale_udis = [
+                format!("{}/.cache/mycloud/Google Drive", home),
+                format!("{}/.cache/mycloud/raw_mount", home),
+                format!("{}/.cache/mycloud/raw_vault", home),
+                format!("{}/MyCloud", home),
+                format!("{}/.local/share/mycloud/vault", home),
+            ];
+            for stale in &stale_udis {
+                while let Some(pos) = cleaned.find(stale.as_str()) {
+                    if let Some(block_start) = cleaned[..pos].rfind("<separator>") {
+                        if let Some(block_end) = cleaned[pos..].find("</separator>") {
+                            let end_idx = pos + block_end + "</separator>".len();
+                            let block = &cleaned[block_start..end_idx];
+                            if block.contains("<IsHidden>true</IsHidden>") {
+                                break;
+                            }
+                            let final_end = if cleaned[end_idx..].starts_with('\n') { end_idx + 1 } else { end_idx };
+                            cleaned.drain(block_start..final_end);
+                            continue;
+                        }
+                    }
+                    if let Some(block_start) = cleaned[..pos].rfind("<bookmark") {
+                        if let Some(block_end) = cleaned[pos..].find("</bookmark>") {
+                            let end_idx = pos + block_end + "</bookmark>".len();
+                            let final_end = if cleaned[end_idx..].starts_with('\n') { end_idx + 1 } else { end_idx };
+                            cleaned.drain(block_start..final_end);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let gdrive_url = format!("webdav://{}@{}/", webdav_user, webdav_addr);
+            let vault_url = format!("webdav://{}@{}/", webdav_user, vault_webdav_addr);
+
+            let mut additions = String::new();
+
+            let uid = unsafe { libc::getuid() };
+            // Ensure raw_vault is hidden in KDE Solid / Dolphin
+            let runtime_udi = if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+                format!("/org/kde/fstab/fuse.rclone{}/mycloud/raw_vault", rt)
+            } else {
+                format!("/org/kde/fstab/fuse.rclone/run/user/{}/mycloud/raw_vault", uid)
+            };
+
+            let home_raw_vault_udi = format!("/org/kde/fstab/fuse.rclone{}/.cache/mycloud/raw_vault", home);
+            let run_uid_udi = format!("/org/kde/fstab/fuse.rclone/run/user/{}/mycloud/raw_vault", uid);
+
+            let hide_targets = [
+                home_raw_vault_udi.as_str(),
+                run_uid_udi.as_str(),
+                runtime_udi.as_str(),
+            ];
+
+            for target in &hide_targets {
+                if !cleaned.contains(*target) {
+                    additions.push_str(&format!(
+                        " <separator>\n  <info>\n   <metadata owner=\"http://www.kde.org\">\n    <UDI>{}</UDI>\n    <isSystemItem>true</isSystemItem>\n    <IsHidden>true</IsHidden>\n   </metadata>\n  </info>\n </separator>\n",
+                        target
+                    ));
+                }
+            }
+
+            if !cleaned.contains(&gdrive_url) {
+                additions.push_str(&format!(
+                    " <bookmark href=\"{}\">\n  <title>Google Drive</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"folder-cloud\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-gdrive-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n   </metadata>\n  </info>\n </bookmark>\n",
+                    gdrive_url
+                ));
+            }
+
+            if !cleaned.contains(&vault_url) {
+                additions.push_str(&format!(
+                    " <bookmark href=\"{}\">\n  <title>MyCloud</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"security-high\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-vault-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n   </metadata>\n  </info>\n </bookmark>\n",
+                    vault_url
+                ));
+            }
+
+            if !additions.is_empty() {
+                if let Some(pos) = cleaned.rfind("</xbel>") {
+                    cleaned.insert_str(pos, &additions);
+                    let _ = std::fs::write(&xbel_path, cleaned);
+                }
+            } else if cleaned.len() != orig_len {
+                let _ = std::fs::write(&xbel_path, cleaned);
+            }
+        }
+    }
+}
+
+/// Removes WebDAV bookmarks from KDE Dolphin Places when daemon shuts down so no dead links remain
+pub fn remove_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr: &str) {
+    if let Ok(home) = std::env::var("HOME") {
+        let xbel_path = PathBuf::from(&home).join(".local/share/user-places.xbel");
+        if !xbel_path.exists() {
+            return;
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&xbel_path) {
+            let mut cleaned = content;
+            let gdrive_url = format!("webdav://{}@{}/", webdav_user, webdav_addr);
+            let vault_url = format!("webdav://{}@{}/", webdav_user, vault_webdav_addr);
+            let old_gdrive_url = format!("webdav://{}/", webdav_addr);
+            let old_vault_url = format!("webdav://{}/", vault_webdav_addr);
+
+            let stale_patterns = [
+                gdrive_url.as_str(),
+                vault_url.as_str(),
+                old_gdrive_url.as_str(),
+                old_vault_url.as_str(),
+                "webdav://127.0.0.1:8765/",
+                "webdav://127.0.0.1:8766/",
+                "mycloud-gdrive-webdav",
+                "mycloud-vault-webdav",
+                "mycloud-vault-storage",
+            ];
+
+            for pattern in &stale_patterns {
+                while let Some(pos) = cleaned.find(pattern) {
+                    if let Some(block_start) = cleaned[..pos].rfind("<bookmark") {
+                        if let Some(block_end) = cleaned[pos..].find("</bookmark>") {
+                            let end_idx = pos + block_end + "</bookmark>".len();
+                            let final_end = if cleaned[end_idx..].starts_with('\n') {
+                                end_idx + 1
+                            } else {
+                                end_idx
+                            };
+                            cleaned.drain(block_start..final_end);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let _ = std::fs::write(&xbel_path, cleaned);
+        }
+    }
+}
+
+/// Configures folder-level metadata rules (.nomedia, .directory, xattrs) so file managers like Dolphin
+/// never freeze or perform expensive background thumbnailing on cloud FUSE mounts.
+pub fn apply_folder_freeze_prevention_rules(mount_path: &Path) {
+    if !mount_path.exists() {
+        return;
+    }
+
+    // 1. Write .nomedia so Linux thumbnailers (kioworker thumbnail.so) skip all media scanning
+    let nomedia = mount_path.join(".nomedia");
+    if !nomedia.exists() {
+        let _ = std::fs::File::create(&nomedia);
+    }
+
+    // 2. Write .directory to instruct Dolphin to never calculate previews or folder sizes for this mount
+    let dot_directory = mount_path.join(".directory");
+    if !dot_directory.exists() {
+        let content = "[Dolphin]\nPreviewsShown=false\nShowFolderSizes=false\n\n[Settings]\nHiddenFilesShown=false\n";
+        let _ = std::fs::write(&dot_directory, content);
+    }
+
+    // 3. Set extended attribute for KDE Plasma 6
+    let _ = std::process::Command::new("setfattr")
+        .args(["-n", "user.dolphin.PreviewsShown", "-v", "false"])
+        .arg(mount_path)
+        .output();
+
+    let home_dir = mount_path.join("home");
+    if home_dir.is_dir() {
+        let h_nomedia = home_dir.join(".nomedia");
+        if !h_nomedia.exists() {
+            let _ = std::fs::File::create(&h_nomedia);
+        }
+        let h_dot_directory = home_dir.join(".directory");
+        if !h_dot_directory.exists() {
+            let content = "[Dolphin]\nPreviewsShown=false\nShowFolderSizes=false\n\n[Settings]\nHiddenFilesShown=false\n";
+            let _ = std::fs::write(&h_dot_directory, content);
+        }
+        let _ = std::process::Command::new("setfattr")
+            .args(["-n", "user.dolphin.PreviewsShown", "-v", "false"])
+            .arg(&home_dir)
+            .output();
+    }
+}
+
+/// Disk and transfer stats returned by rclone RC API
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RcloneStats {
+    pub upload_speed: u64,
+    pub download_speed: u64,
+    pub storage_used: u64,
+    pub storage_total: u64,
+    pub files_synced: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RcloneAboutResponse {
+    pub total: Option<u64>,
+    pub used: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RcloneCoreStatsResponse {
+    #[allow(dead_code)]
+    pub bytes: Option<u64>,
+    pub speed: Option<f64>,
+    #[allow(dead_code)]
+    pub transfers: Option<u64>,
+}
+
+/// Generates an Apache htpasswd SHA1 record: `username:{SHA}base64(sha1(password))`
+pub fn generate_htpasswd_line(username: &str, password: &str) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+
+    let mut hasher = Sha1::new();
+    hasher.update(password.as_bytes());
+    let digest = hasher.finalize();
+    let b64 = BASE64.encode(digest);
+    format!("{}:{{SHA}}{}\n", username, b64)
+}
+
+/// Creates or updates a secure htpasswd file with permissions 0600
+pub fn write_htpasswd_file(username: &str, password: &str) -> Result<PathBuf, std::io::Error> {
+    let htpasswd_dir = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("mycloud")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/mycloud")
+    } else {
+        std::env::temp_dir().join("mycloud")
+    };
+
+    std::fs::create_dir_all(&htpasswd_dir)?;
+    let htpasswd_path = htpasswd_dir.join("webdav.htpasswd");
+    let content = generate_htpasswd_line(username, password);
+    std::fs::write(&htpasswd_path, content)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&htpasswd_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(htpasswd_path)
+}
+
+/// Attempts to read an existing WebDAV password saved by KDE's kpasswdserver in KWallet (`kdewallet`).
+/// This ensures that whatever password the user entered in Dolphin's KWallet prompt is honored by rclone's htpasswd.
+pub fn read_kwallet_webdav_password(
+    webdav_user: &str,
+    webdav_addr: &str,
+    vault_webdav_addr: &str,
+) -> Option<String> {
+    let candidate_keys = [
+        format!("webdav-{}@{}-MyCloud Vault", webdav_user, vault_webdav_addr),
+        format!("webdav-{}@{}-MyCloud", webdav_user, webdav_addr),
+        format!("webdav-{}@{}", webdav_user, vault_webdav_addr),
+        format!("webdav-{}@{}", webdav_user, webdav_addr),
+    ];
+
+    for key in &candidate_keys {
+        if let Ok(out) = std::process::Command::new("kwallet-query")
+            .args(["-f", "Passwords", "-r", key, "kdewallet"])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(pass) = json.get("password").and_then(|v| v.as_str()) {
+                        if !pass.is_empty() {
+                            return Some(pass.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Configuration options for spawning rclone and FUSE processes
+#[derive(Debug, Clone)]
+pub struct ProcessConfig {
+    pub rclone_bin: String,
+    pub rclone_remote: String,
+    pub rc_addr: String,
+    pub vault_rc_addr: String,
+    pub rc_user: String,
+    pub rc_pass: String,
+    pub raw_mount_path: PathBuf,
+    pub target_mount_path: PathBuf,
+    pub fuse_bin: PathBuf,
+    pub config_path: PathBuf,
+    pub webdav_addr: String,
+    pub vault_webdav_addr: String,
+    pub webdav_user: String,
+    pub webdav_pass: String,
+    pub htpasswd_path: PathBuf,
+    pub optimizations: crate::config::OptimizationConfig,
+}
+
+/// Orchestrates the lifecycles of rclone, WebDAV, and mycloud-fuse subprocesses
+pub struct ProcessManager {
+    config: ProcessConfig,
+    rclone_child: Option<Child>,
+    fuse_child: Option<Child>,
+    webdav_child: Option<Child>,
+    vault_webdav_child: Option<Child>,
+    http_client: reqwest::Client,
+    /// Separate client with a long timeout for Drive's slow `operations/about` call
+    about_client: reqwest::Client,
+    last_about_attempt: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    /// Last successfully fetched (used, total) storage quota in bytes
+    cached_quota: Arc<tokio::sync::RwLock<(u64, u64)>>,
+    last_file_count_attempt: Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>>,
+    /// Total count of monitored files inside the cloud vault
+    cached_files_count: Arc<AtomicU64>,
+    restart_attempts: u32,
+    next_restart_allowed: Option<tokio::time::Instant>,
+    last_healthy_since: Option<tokio::time::Instant>,
+}
+
+impl ProcessManager {
+    pub fn set_remote(&mut self, remote: String) {
+        self.config.rclone_remote = remote;
+        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+    }
+
+    pub fn raw_mount_path(&self) -> &std::path::Path {
+        &self.config.raw_mount_path
+    }
+
+    pub fn new(config: ProcessConfig, initial_quota: (u64, u64), initial_files: u64) -> Self {
+        let http_timeout = Duration::from_secs(config.optimizations.network.http_timeout_secs);
+        let about_timeout = Duration::from_secs(config.optimizations.network.about_timeout_secs);
+
+        let http_client = reqwest::Client::builder()
+            .timeout(http_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let about_client = reqwest::Client::builder()
+            .timeout(about_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        Self {
+            config,
+            rclone_child: None,
+            fuse_child: None,
+            webdav_child: None,
+            vault_webdav_child: None,
+            http_client,
+            about_client,
+            last_about_attempt: Arc::new(tokio::sync::RwLock::new(None)),
+            cached_quota: Arc::new(tokio::sync::RwLock::new(initial_quota)),
+            last_file_count_attempt: Arc::new(tokio::sync::RwLock::new(None)),
+            cached_files_count: Arc::new(AtomicU64::new(initial_files)),
+            restart_attempts: 0,
+            next_restart_allowed: None,
+            last_healthy_since: None,
+        }
+    }
+
+    /// Checks if a self-healing restart attempt is permitted under the current exponential backoff
+    pub fn can_attempt_restart(&self) -> bool {
+        self.next_restart_allowed
+            .map(|t| tokio::time::Instant::now() >= t)
+            .unwrap_or(true)
+    }
+
+    /// Records a failed child process and computes the next exponential backoff delay (2s -> 4s -> 8s -> 16s -> 32s -> 60s)
+    pub fn record_restart_attempt(&mut self) -> Duration {
+        let shift = self.restart_attempts.min(5);
+        let delay = Duration::from_secs(2u64 << shift).min(Duration::from_secs(60));
+        self.restart_attempts = self.restart_attempts.saturating_add(1);
+        self.next_restart_allowed = Some(tokio::time::Instant::now() + delay);
+        self.last_healthy_since = None;
+        delay
+    }
+
+    /// Resets restart attempts back to 0 if all services remain healthy for at least 60 seconds
+    pub fn record_healthy_tick(&mut self) {
+        let now = tokio::time::Instant::now();
+        match self.last_healthy_since {
+            Some(since) => {
+                if now.duration_since(since) >= Duration::from_secs(60) {
+                    self.restart_attempts = 0;
+                    self.next_restart_allowed = None;
+                }
+            }
+            None => {
+                self.last_healthy_since = Some(now);
+            }
+        }
+    }
+
+    fn refresh_htpasswd_from_kwallet(&mut self) {
+        if let Some(kw_pass) = read_kwallet_webdav_password(
+            &self.config.webdav_user,
+            &self.config.webdav_addr,
+            &self.config.vault_webdav_addr,
+        ) {
+            self.config.webdav_pass = kw_pass;
+        }
+        let _ = write_htpasswd_file(&self.config.webdav_user, &self.config.webdav_pass);
+    }
+
+    /// Spawns rclone WebDAV server providing flat network access to Google Drive for Dolphin
+    pub async fn spawn_webdav(&mut self) -> Result<u32, ProcessError> {
+        self.refresh_htpasswd_from_kwallet();
+
+        let remote_spec = if self.config.rclone_remote.ends_with(':') {
+            self.config.rclone_remote.clone()
+        } else {
+            format!("{}:", self.config.rclone_remote)
+        };
+
+        let bind_addr = ensure_localhost_addr(&self.config.webdav_addr);
+        info!(
+            "Spawning rclone serve webdav for remote '{}' on {}",
+            remote_spec, bind_addr
+        );
+
+        let mut cmd = Command::new(&self.config.rclone_bin);
+        cmd.arg("serve")
+            .arg("webdav")
+            .arg(&remote_spec)
+            .arg("--addr")
+            .arg(&bind_addr)
+            .arg("--htpasswd")
+            .arg(&self.config.htpasswd_path)
+            .arg("--realm")
+            .arg("MyCloud")
+            .arg("--vfs-cache-mode")
+            .arg(&self.config.optimizations.vfs.cache_mode)
+            .arg("--vfs-cache-max-size")
+            .arg(&self.config.optimizations.vfs.cache_max_size)
+            .arg("--vfs-cache-max-age")
+            .arg(&self.config.optimizations.vfs.cache_max_age)
+            .arg("--vfs-read-chunk-size")
+            .arg(&self.config.optimizations.vfs.read_chunk_size)
+            .arg("--vfs-read-chunk-size-limit")
+            .arg(&self.config.optimizations.vfs.read_chunk_size_limit)
+            .arg("--dir-cache-time")
+            .arg(&self.config.optimizations.cache.dir_cache_time)
+            .arg("--poll-interval")
+            .arg(&self.config.optimizations.cache.poll_interval)
+            .arg("--drive-pacer-min-sleep")
+            .arg(&self.config.optimizations.network.drive_pacer_min_sleep)
+            .arg("--drive-pacer-burst")
+            .arg(self.config.optimizations.network.drive_pacer_burst.to_string())
+            .arg("--timeout")
+            .arg(&self.config.optimizations.network.timeout)
+            .arg("--contimeout")
+            .arg(&self.config.optimizations.network.contimeout)
+            .arg("--low-level-retries")
+            .arg(self.config.optimizations.network.low_level_retries.to_string())
+            .arg("--retries")
+            .arg(self.config.optimizations.network.retries.to_string())
+            .arg("--retries-sleep")
+            .arg("2s");
+
+        if self.config.optimizations.network.no_checksum {
+            cmd.arg("--no-checksum");
+        }
+
+        cmd.stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let child = cmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+            name: "rclone-webdav",
+            source: e,
+        })?;
+
+        let pid = child.id().unwrap_or(0);
+        info!("rclone serve webdav spawned with PID {}", pid);
+        self.webdav_child = Some(child);
+
+        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+
+        Ok(pid)
+    }
+
+    /// Spawns rclone subprocess mounting the device-specific vault folder
+    pub async fn spawn_rclone(&mut self) -> Result<u32, ProcessError> {
+        let remote_clean = self.config.rclone_remote.trim_end_matches(':');
+        let vault_folder = get_device_vault_folder();
+        let vault_remote = format!("{}:{}/", remote_clean, vault_folder);
+
+        info!(
+            "Spawning rclone mount subprocess for device vault '{}' to {:?}",
+            vault_remote, self.config.raw_mount_path
+        );
+
+        // Lazily unmount any previous dangling mount before starting
+        unmount_path_lazy(&self.config.raw_mount_path);
+        if let Some(parent) = self.config.raw_mount_path.parent() {
+            unmount_path_lazy(&parent.join("raw_mount"));
+            unmount_path_lazy(&parent.join("raw_vault"));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let old_cache = PathBuf::from(home).join(".cache/mycloud");
+            unmount_path_lazy(&old_cache.join("raw_mount"));
+            unmount_path_lazy(&old_cache.join("raw_vault"));
+        }
+
+        if let Err(e) = prepare_empty_mountpoint(&self.config.raw_mount_path) {
+            warn!("Failed to prepare empty raw mount point {:?}: {}", self.config.raw_mount_path, e);
+        }
+
+        let mut cmd = Command::new(&self.config.rclone_bin);
+        cmd.arg("mount")
+            .arg(&vault_remote)
+            .arg(&self.config.raw_mount_path)
+            .arg("--vfs-cache-mode")
+            .arg(&self.config.optimizations.vfs.cache_mode)
+            .arg("--vfs-cache-max-size")
+            .arg(&self.config.optimizations.vfs.cache_max_size)
+            .arg("--vfs-cache-max-age")
+            .arg(&self.config.optimizations.vfs.cache_max_age)
+            .arg("--vfs-read-chunk-size")
+            .arg(&self.config.optimizations.vfs.read_chunk_size)
+            .arg("--vfs-read-chunk-size-limit")
+            .arg(&self.config.optimizations.vfs.read_chunk_size_limit)
+            .arg("--dir-cache-time")
+            .arg(&self.config.optimizations.cache.dir_cache_time)
+            .arg("--attr-timeout")
+            .arg(&self.config.optimizations.cache.attr_timeout)
+            .arg("--poll-interval")
+            .arg(&self.config.optimizations.cache.poll_interval)
+            .arg("--drive-pacer-min-sleep")
+            .arg(&self.config.optimizations.network.drive_pacer_min_sleep)
+            .arg("--drive-pacer-burst")
+            .arg(self.config.optimizations.network.drive_pacer_burst.to_string())
+            .arg("--timeout")
+            .arg(&self.config.optimizations.network.timeout)
+            .arg("--contimeout")
+            .arg(&self.config.optimizations.network.contimeout)
+            .arg("--low-level-retries")
+            .arg(self.config.optimizations.network.low_level_retries.to_string())
+            .arg("--retries")
+            .arg(self.config.optimizations.network.retries.to_string())
+            .arg("--retries-sleep")
+            .arg("2s")
+            .arg("--vfs-read-ahead")
+            .arg(&self.config.optimizations.vfs.read_ahead)
+            .arg("--buffer-size")
+            .arg(&self.config.optimizations.vfs.buffer_size);
+
+        if self.config.optimizations.network.no_checksum {
+            cmd.arg("--no-checksum");
+        }
+
+        cmd.arg("--rc")
+            .arg("--rc-addr")
+            .arg(&self.config.rc_addr)
+            .arg("--rc-user")
+            .arg(&self.config.rc_user)
+            .env("RCLONE_RC_PASS", &self.config.rc_pass)
+            .arg("--log-level")
+            .arg("NOTICE")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let child = cmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+            name: "rclone",
+            source: e,
+        })?;
+
+        let pid = child.id().unwrap_or(0);
+        info!("rclone vault mount spawned successfully with PID {}", pid);
+        self.rclone_child = Some(child);
+
+        Ok(pid)
+    }
+
+    /// Performs HTTP readiness checks against the rclone Remote Control (RC) API
+    pub async fn wait_rclone_rc_ready(&self, timeout: Duration) -> Result<(), ProcessError> {
+        let url = format!("http://{}/core/version", self.config.rc_addr);
+        info!(
+            "Awaiting rclone RC API readiness at {} (timeout: {:?})",
+            url, timeout
+        );
+
+        let start = tokio::time::Instant::now();
+        let retry_interval = Duration::from_millis(self.config.optimizations.network.rc_ready_retry_ms);
+
+        while start.elapsed() < timeout {
+            match self
+                .http_client
+                .post(&url)
+                .basic_auth(&self.config.rc_user, Some(&self.config.rc_pass))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    info!("rclone RC API responded successfully with HTTP 200 OK");
+                    return Ok(());
+                }
+                Ok(resp) => {
+                    warn!(
+                        "rclone RC API returned non-success status: {}",
+                        resp.status()
+                    );
+                }
+                Err(_) => {
+                    // Process may still be initializing socket
+                }
+            }
+            sleep(retry_interval).await;
+        }
+
+        Err(ProcessError::RcReadinessTimeout(timeout))
+    }
+
+    /// Asynchronously pre-warms the rclone VFS directory caches for both mounts and WebDAV servers
+    /// so navigating folders in Dolphin is instant right from the start.
+    pub fn warm_vfs_cache(&self) {
+        if !self.config.optimizations.features.enable_vfs_prewarm {
+            info!("VFS directory cache pre-warming disabled by optimizations config.");
+            return;
+        }
+
+        let refresh_url = format!("http://{}/vfs/refresh", self.config.rc_addr);
+        let vault_refresh_url = format!("http://{}/vfs/refresh", self.config.vault_rc_addr);
+        let client = self.http_client.clone();
+        let user = self.config.rc_user.clone();
+        let pass = self.config.rc_pass.clone();
+
+        tokio::spawn(async move {
+            info!("Pre-warming rclone VFS directory caches (vfs/refresh recursive=true)...");
+            let _ = client
+                .post(&refresh_url)
+                .basic_auth(&user, Some(&pass))
+                .json(&serde_json::json!({
+                    "recursive": "true"
+                }))
+                .send()
+                .await;
+
+            let _ = client
+                .post(&vault_refresh_url)
+                .basic_auth(&user, Some(&pass))
+                .json(&serde_json::json!({
+                    "recursive": "true"
+                }))
+                .send()
+                .await;
+
+            info!("Rclone VFS directory caches pre-warmed successfully!");
+        });
+    }
+
+    /// Queries real Google Drive storage quota and live transfer stats via rclone RC API
+    pub async fn query_rclone_stats(&self) -> RcloneStats {
+        let mut stats = RcloneStats::default();
+
+        let remote_spec = if self.config.rclone_remote.ends_with(':') {
+            self.config.rclone_remote.clone()
+        } else {
+            format!("{}:", self.config.rclone_remote)
+        };
+
+        // 1. Quota from operations/about: cached, refreshed at most every about_refresh_interval_secs.
+        // Google Drive about calls are network-bound and take several seconds.
+        // We fetch quota in a non-blocking background task so 1-second transfer ticks never freeze.
+        let about_refresh_interval = Duration::from_secs(self.config.optimizations.network.about_refresh_interval_secs);
+        let should_refresh = {
+            let mut last_attempt = self.last_about_attempt.write().await;
+            let due = match *last_attempt {
+                Some(inst) => inst.elapsed() >= about_refresh_interval,
+                None => true,
+            };
+            if due {
+                *last_attempt = Some(tokio::time::Instant::now());
+            }
+            due
+        };
+
+        if should_refresh {
+            let rc_addr = self.config.rc_addr.clone();
+            let rc_user = self.config.rc_user.clone();
+            let rc_pass = self.config.rc_pass.clone();
+            let rclone_bin = self.config.rclone_bin.clone();
+            let remote_spec_clone = remote_spec.clone();
+            let about_client = self.about_client.clone();
+            let cached_quota = Arc::clone(&self.cached_quota);
+            let last_about_attempt = Arc::clone(&self.last_about_attempt);
+            let config_path = self.config.config_path.clone();
+
+            tokio::spawn(async move {
+                info!(
+                    "Querying cloud storage quota for '{}' via RC API...",
+                    remote_spec_clone
+                );
+                let about_url = format!("http://{}/operations/about", rc_addr);
+                let mut fetched = None;
+
+                // Primary attempt: RC operations/about
+                match about_client
+                    .post(&about_url)
+                    .basic_auth(&rc_user, Some(&rc_pass))
+                    .json(&serde_json::json!({ "fs": remote_spec_clone }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<RcloneAboutResponse>().await {
+                            Ok(about_data) => {
+                                let total = about_data.total.unwrap_or(0);
+                                let used = about_data.used.unwrap_or(0);
+                                if total > 0 {
+                                    fetched = Some((used, total));
+                                }
+                            }
+                            Err(e) => warn!("Failed to parse rclone about JSON response: {}", e),
+                        }
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            "rclone operations/about returned HTTP non-success status: {}",
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        warn!("rclone operations/about HTTP request failed: {}", e);
+                    }
+                }
+
+                // Resilient fallback: CLI `rclone about <remote> --json`
+                if fetched.is_none() {
+                    info!(
+                        "Falling back to CLI 'rclone about' for '{}'...",
+                        remote_spec_clone
+                    );
+                    match Command::new(&rclone_bin)
+                        .arg("about")
+                        .arg(&remote_spec_clone)
+                        .arg("--json")
+                        .output()
+                        .await
+                    {
+                        Ok(output) if output.status.success() => {
+                            match serde_json::from_slice::<RcloneAboutResponse>(&output.stdout) {
+                                Ok(about_data) => {
+                                    let total = about_data.total.unwrap_or(0);
+                                    let used = about_data.used.unwrap_or(0);
+                                    if total > 0 {
+                                        fetched = Some((used, total));
+                                    }
+                                }
+                                Err(e) => warn!("Failed to parse CLI rclone about JSON: {}", e),
+                            }
+                        }
+                        Ok(output) => {
+                            warn!(
+                                "CLI rclone about exited with non-zero code: {:?}",
+                                output.status.code()
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to execute CLI rclone about fallback: {}", e);
+                        }
+                    }
+                }
+
+                if let Some((used, total)) = fetched {
+                    info!(
+                        "Cloud storage quota fetched successfully: used={} bytes, total={} bytes",
+                        used, total
+                    );
+                    *cached_quota.write().await = (used, total);
+                    let cfg_path = config_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut cfg) = crate::config::DaemonConfig::load_from(&cfg_path) {
+                            if cfg.cached_storage_used != used || cfg.cached_storage_total != total {
+                                cfg.cached_storage_used = used;
+                                cfg.cached_storage_total = total;
+                                let _ = cfg.save_to(&cfg_path);
+                            }
+                        }
+                    });
+                } else {
+                    warn!("Failed to fetch cloud storage quota; scheduling retry in 10s");
+                    // On failure, schedule retry in 10 seconds instead of backing off 5 minutes
+                    let mut attempt = last_about_attempt.write().await;
+                    *attempt = Some(tokio::time::Instant::now() - Duration::from_secs(290));
+                }
+            });
+        }
+
+        let (cached_used, cached_total) = *self.cached_quota.read().await;
+        stats.storage_used = cached_used;
+        stats.storage_total = cached_total;
+
+        // 2. Fetch live speed from core/stats
+        let stats_url = format!("http://{}/core/stats", self.config.rc_addr);
+        if let Ok(resp) = self
+            .http_client
+            .post(&stats_url)
+            .basic_auth(&self.config.rc_user, Some(&self.config.rc_pass))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(core_data) = resp.json::<RcloneCoreStatsResponse>().await {
+                    let speed = core_data.speed.unwrap_or(0.0) as u64;
+                    stats.download_speed = speed;
+                }
+            }
+        }
+
+        // 3. Monitored file count: cached from config, refreshed at most every 1 hour without hammering cloud mount
+        const FILE_COUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+        let should_refresh_files = {
+            let mut last_attempt = self.last_file_count_attempt.write().await;
+            let due = match *last_attempt {
+                Some(inst) => inst.elapsed() >= FILE_COUNT_REFRESH_INTERVAL,
+                None => true,
+            };
+            if due {
+                *last_attempt = Some(tokio::time::Instant::now());
+            }
+            due
+        };
+
+        if should_refresh_files {
+            let raw_path = self.config.raw_mount_path.clone();
+            let target_path = self.config.target_mount_path.clone();
+            let cached_files = Arc::clone(&self.cached_files_count);
+            let cfg_path = self.config.config_path.clone();
+
+            tokio::task::spawn_blocking(move || {
+                // If count is already populated from config, skip expensive traversal of the 150GB remote mount
+                if cached_files.load(Ordering::Relaxed) > 0 {
+                    return;
+                }
+                let count = count_files_in_dir(&raw_path);
+                let final_count = if count > 0 {
+                    count
+                } else {
+                    count_files_in_dir(&target_path)
+                };
+                cached_files.store(final_count, Ordering::Relaxed);
+                if let Ok(mut cfg) = crate::config::DaemonConfig::load_from(&cfg_path) {
+                    if cfg.cached_files_count != final_count {
+                        cfg.cached_files_count = final_count;
+                        let _ = cfg.save_to(&cfg_path);
+                    }
+                }
+            });
+        }
+
+        stats.files_synced = self.cached_files_count.load(Ordering::Relaxed);
+
+        stats
+    }
+
+    /// Spawns the mycloud-fuse encryption layer, passing 32-byte key via stdin pipe
+    pub async fn spawn_fuse(&mut self, key: &[u8; 32]) -> Result<u32, ProcessError> {
+        info!(
+            "Spawning mycloud-fuse binary {:?} for target {:?} using stdin key pipe",
+            self.config.fuse_bin, self.config.target_mount_path
+        );
+
+        // Lazily unmount any previous dangling mount before starting
+        unmount_path_lazy(&self.config.target_mount_path);
+
+        if let Err(e) = prepare_empty_mountpoint(&self.config.target_mount_path) {
+            warn!("Failed to prepare empty target mount point {:?}: {}", self.config.target_mount_path, e);
+        }
+
+        let mut cmd = Command::new(&self.config.fuse_bin);
+        cmd.arg("--raw-path")
+            .arg(&self.config.raw_mount_path)
+            .arg("--mount-path")
+            .arg(&self.config.target_mount_path)
+            .arg("--key-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+            name: "mycloud-fuse",
+            source: e,
+        })?;
+
+        // Write 32-byte key to child stdin and close pipe
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(key).await.map_err(ProcessError::Io)?;
+            stdin.flush().await.map_err(ProcessError::Io)?;
+            drop(stdin);
+        }
+
+        let pid = child.id().unwrap_or(0);
+        info!("mycloud-fuse spawned successfully with PID {}", pid);
+        self.fuse_child = Some(child);
+
+        // Wait for target mount to be ready before Vault WebDAV and freeze prevention (1.4)
+        let mount_timeout = Duration::from_secs(self.config.optimizations.network.rc_ready_timeout_secs);
+        let retry_interval = Duration::from_millis(self.config.optimizations.network.rc_ready_retry_ms);
+        wait_for_mount(&self.config.target_mount_path, "fuse", mount_timeout, retry_interval).await?;
+
+        if self.config.optimizations.features.enable_freeze_prevention {
+            apply_folder_freeze_prevention_rules(&self.config.target_mount_path);
+        }
+
+        if let Err(e) = self.spawn_vault_webdav().await {
+            warn!("Failed to spawn Vault WebDAV server: {}", e);
+        }
+
+        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+
+        Ok(pid)
+    }
+
+    /// Spawns rclone WebDAV server exposing decrypted MyCloud vault for Dolphin's Uzak Konum
+    pub async fn spawn_vault_webdav(&mut self) -> Result<u32, ProcessError> {
+        self.refresh_htpasswd_from_kwallet();
+        let vault_bind_addr = ensure_localhost_addr(&self.config.vault_webdav_addr);
+        let mut wcmd = Command::new(&self.config.rclone_bin);
+        wcmd.arg("serve")
+            .arg("webdav")
+            .arg(&self.config.target_mount_path)
+            .arg("--addr")
+            .arg(&vault_bind_addr)
+            .arg("--htpasswd")
+            .arg(&self.config.htpasswd_path)
+            .arg("--realm")
+            .arg("MyCloud Vault")
+            .arg("--vfs-cache-mode")
+            .arg(&self.config.optimizations.vfs.cache_mode)
+            .arg("--vfs-cache-max-size")
+            .arg(&self.config.optimizations.vfs.cache_max_size)
+            .arg("--vfs-cache-max-age")
+            .arg(&self.config.optimizations.vfs.cache_max_age)
+            .arg("--vfs-read-chunk-size")
+            .arg(&self.config.optimizations.vfs.read_chunk_size)
+            .arg("--vfs-read-chunk-size-limit")
+            .arg(&self.config.optimizations.vfs.read_chunk_size_limit)
+            .arg("--dir-cache-time")
+            .arg(&self.config.optimizations.cache.dir_cache_time);
+
+        if self.config.optimizations.network.no_checksum {
+            wcmd.arg("--no-checksum");
+        }
+
+        wcmd.arg("--rc")
+            .arg("--rc-addr")
+            .arg(&self.config.vault_rc_addr)
+            .arg("--rc-user")
+            .arg(&self.config.rc_user)
+            .env("RCLONE_RC_PASS", &self.config.rc_pass)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let child = wcmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+            name: "vault-webdav",
+            source: e,
+        })?;
+        let pid = child.id().unwrap_or(0);
+        info!(
+            "Vault WebDAV server spawned with PID {} on {}",
+            pid,
+            vault_bind_addr
+        );
+        self.vault_webdav_child = Some(child);
+        self.warm_vfs_cache();
+        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+        Ok(pid)
+    }
+
+    /// Automatically restarts crashed services with clean cleanup and reconnection
+    pub async fn respawn_crashed_services(
+        &mut self,
+        exited_name: &'static str,
+        key: &[u8; 32],
+        skip_rclone: bool,
+    ) -> Result<(), ProcessError> {
+        if exited_name == "rclone" && !skip_rclone {
+            self.spawn_rclone().await?;
+            let rc_timeout = Duration::from_secs(self.config.optimizations.network.rc_ready_timeout_secs);
+            let retry_interval = Duration::from_millis(self.config.optimizations.network.rc_ready_retry_ms);
+            self.wait_rclone_rc_ready(rc_timeout).await?;
+            wait_for_mount(&self.config.raw_mount_path, "fuse", rc_timeout, retry_interval).await?;
+            if self.config.optimizations.features.enable_freeze_prevention {
+                apply_folder_freeze_prevention_rules(&self.config.raw_mount_path);
+            }
+            self.warm_vfs_cache();
+
+            if self.webdav_child.is_none() {
+                let _ = self.spawn_webdav().await;
+            }
+
+            if let Some(mut fuse) = self.fuse_child.take() {
+                let _ = fuse.kill().await;
+            }
+            unmount_path_lazy(&self.config.target_mount_path);
+            if let Some(mut v_webdav) = self.vault_webdav_child.take() {
+                let _ = v_webdav.kill().await;
+            }
+            self.spawn_fuse(key).await?;
+        } else if exited_name == "mycloud-fuse" {
+            self.spawn_fuse(key).await?;
+        } else if exited_name == "rclone-webdav" && !skip_rclone {
+            self.spawn_webdav().await?;
+        } else if exited_name == "vault-webdav" {
+            self.spawn_vault_webdav().await?;
+        }
+        Ok(())
+    }
+
+    /// Checks if any background child processes have exited prematurely
+    pub fn check_child_health(&mut self) -> Result<(), ProcessError> {
+        if let Some(ref mut rclone) = self.rclone_child {
+            match rclone.try_wait() {
+                Ok(Some(status)) => {
+                    warn!("rclone child process exited with status: {}", status);
+                    self.rclone_child = None;
+                    return Err(ProcessError::ProcessExited("rclone"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Error polling rclone child: {}", e);
+                }
+            }
+        }
+
+        if let Some(ref mut webdav) = self.webdav_child {
+            match webdav.try_wait() {
+                Ok(Some(status)) => {
+                    warn!("rclone-webdav child process exited with status: {}", status);
+                    self.webdav_child = None;
+                    return Err(ProcessError::ProcessExited("rclone-webdav"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Error polling rclone-webdav child: {}", e);
+                }
+            }
+        }
+
+        if let Some(ref mut v_webdav) = self.vault_webdav_child {
+            match v_webdav.try_wait() {
+                Ok(Some(status)) => {
+                    warn!("vault-webdav child process exited with status: {}", status);
+                    self.vault_webdav_child = None;
+                    return Err(ProcessError::ProcessExited("vault-webdav"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Error polling vault-webdav child: {}", e);
+                }
+            }
+        }
+
+        if let Some(ref mut fuse) = self.fuse_child {
+            match fuse.try_wait() {
+                Ok(Some(status)) => {
+                    warn!("mycloud-fuse child process exited with status: {}", status);
+                    self.fuse_child = None;
+                    return Err(ProcessError::ProcessExited("mycloud-fuse"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Error polling mycloud-fuse child: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the active rclone PID if running
+    pub fn rclone_pid(&self) -> Option<u32> {
+        self.rclone_child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Returns the active mycloud-fuse PID if running
+    pub fn fuse_pid(&self) -> Option<u32> {
+        self.fuse_child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Returns the active WebDAV PID if running
+    pub fn webdav_pid(&self) -> Option<u32> {
+        self.webdav_child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Returns the active Vault WebDAV PID if running
+    pub fn vault_webdav_pid(&self) -> Option<u32> {
+        self.vault_webdav_child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Sends SIGTERM to all child processes and cleans up mount points
+    pub async fn terminate_all(&mut self) -> Result<(), ProcessError> {
+        info!("Initiating graceful termination of child processes");
+        let sigterm_timeout = Duration::from_secs(self.config.optimizations.process.sigterm_timeout_secs);
+
+        // 0. Terminate WebDAV
+        if let Some(mut webdav) = self.webdav_child.take() {
+            if let Some(pid) = webdav.id() {
+                info!("Sending SIGTERM to rclone-webdav (PID {})", pid);
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            tokio::select! {
+                _ = webdav.wait() => {
+                    info!("rclone-webdav exited cleanly");
+                }
+                _ = sleep(sigterm_timeout) => {
+                    warn!("rclone-webdav did not exit within timeout, sending SIGKILL");
+                    let _ = webdav.kill().await;
+                }
+            }
+        }
+
+        // 0.1 Terminate Vault WebDAV
+        if let Some(mut v_webdav) = self.vault_webdav_child.take() {
+            if let Some(pid) = v_webdav.id() {
+                info!("Sending SIGTERM to vault-webdav (PID {})", pid);
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            tokio::select! {
+                _ = v_webdav.wait() => {
+                    info!("vault-webdav exited cleanly");
+                }
+                _ = sleep(sigterm_timeout) => {
+                    warn!("vault-webdav did not exit within timeout, sending SIGKILL");
+                    let _ = v_webdav.kill().await;
+                }
+            }
+        }
+
+        // 1. Terminate FUSE first so userspace unmounts cleanly
+        if let Some(mut fuse) = self.fuse_child.take() {
+            if let Some(pid) = fuse.id() {
+                info!("Sending SIGTERM to mycloud-fuse (PID {})", pid);
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            tokio::select! {
+                _ = fuse.wait() => {
+                    info!("mycloud-fuse exited cleanly");
+                }
+                _ = sleep(sigterm_timeout) => {
+                    warn!("mycloud-fuse did not exit within timeout, sending SIGKILL");
+                    let _ = fuse.kill().await;
+                }
+            }
+        }
+
+        // 2. Unmount target via fusermount3 / fusermount with -z (lazy unmount)
+        unmount_path_lazy(&self.config.target_mount_path);
+
+        // 3. Terminate rclone
+        if let Some(mut rclone) = self.rclone_child.take() {
+            if let Some(pid) = rclone.id() {
+                info!("Sending SIGTERM to rclone (PID {})", pid);
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            tokio::select! {
+                _ = rclone.wait() => {
+                    info!("rclone exited cleanly");
+                }
+                _ = sleep(sigterm_timeout) => {
+                    warn!("rclone did not exit within timeout, sending SIGKILL");
+                    let _ = rclone.kill().await;
+                }
+            }
+        }
+
+        // 4. Unmount raw mount via fusermount3 / fusermount with -z (lazy unmount)
+        unmount_path_lazy(&self.config.raw_mount_path);
+
+        // 5. Clean up WebDAV bookmarks from KDE Places so no stale links remain when stopped
+        remove_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+
+        // 6. Clean up temporary htpasswd file
+        let _ = std::fs::remove_file(&self.config.htpasswd_path);
+
+        info!("All child processes and mounts successfully terminated");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unescape_octal() {
+        assert_eq!(unescape_octal(r"hello\040world"), "hello world");
+        assert_eq!(unescape_octal(r"/home/testuser/My\040Cloud/Vault"), "/home/testuser/My Cloud/Vault");
+        assert_eq!(unescape_octal(r"normal_path/no_escapes"), "normal_path/no_escapes");
+        assert_eq!(unescape_octal(r"\011tab\012newline"), "\ttab\nnewline");
+    }
+
+    #[test]
+    fn test_is_mountpoint_ready() {
+        let sample_mountinfo = r#"
+36 35 98:0 / /mnt/test rw,noatime master:1 - ext4 /dev/root rw,errors=continue
+120 45 0:50 / /home/testuser/.cache/mycloud/raw_vault rw,nosuid,nodev - fuse.rclone mycloud: rw,user_id=1000,group_id=1000
+125 45 0:52 / /home/testuser/My\040Cloud rw,nosuid,nodev - fuse.mycloud mycloud rw,user_id=1000,group_id=1000
+130 45 0:55 / /home/testuser/Desktop rw,nosuid,nodev - fuse mycloud rw,user_id=1000,group_id=1000
+"#;
+
+        // Matching fuse.rclone
+        let target_raw = Path::new("/home/testuser/.cache/mycloud/raw_vault");
+        assert!(is_mountpoint_ready(sample_mountinfo, target_raw, "fuse.rclone"));
+        assert!(is_mountpoint_ready(sample_mountinfo, target_raw, "fuse"));
+
+        // Matching path with octal escape (\040 space)
+        let target_space = Path::new("/home/testuser/My Cloud");
+        assert!(is_mountpoint_ready(sample_mountinfo, target_space, "fuse.mycloud"));
+        assert!(is_mountpoint_ready(sample_mountinfo, target_space, "fuse"));
+
+        // Matching fuse
+        let target_desktop = Path::new("/home/testuser/Desktop");
+        assert!(is_mountpoint_ready(sample_mountinfo, target_desktop, "fuse"));
+
+        // Non-matching path
+        let target_nonexistent = Path::new("/home/testuser/nonexistent");
+        assert!(!is_mountpoint_ready(sample_mountinfo, target_nonexistent, "fuse"));
+
+        // Wrong fstype prefix
+        assert!(!is_mountpoint_ready(sample_mountinfo, target_raw, "ext4"));
+    }
+
+    #[test]
+    fn test_ensure_localhost_addr() {
+        assert_eq!(ensure_localhost_addr("127.0.0.1:8765"), "127.0.0.1:8765");
+        assert_eq!(ensure_localhost_addr("0.0.0.0:8765"), "127.0.0.1:8765");
+        assert_eq!(ensure_localhost_addr("192.168.1.100:9999"), "127.0.0.1:9999");
+        assert_eq!(ensure_localhost_addr("8765"), "127.0.0.1:8765");
+    }
+
+    #[test]
+    fn test_prepare_empty_mountpoint() {
+        let temp_dir = std::env::temp_dir().join(format!("mycloud_test_mountpoint_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir failed");
+
+        // Create stale files inside the directory (simulating unmounted leftovers)
+        let stale_file = temp_dir.join(".nomedia");
+        std::fs::write(&stale_file, b"").expect("write stale file failed");
+        let stale_dir = temp_dir.join("old_subfolder");
+        std::fs::create_dir_all(&stale_dir).expect("write stale dir failed");
+
+        assert!(stale_file.exists());
+        assert!(stale_dir.exists());
+
+        // Call prepare_empty_mountpoint
+        prepare_empty_mountpoint(&temp_dir).expect("prepare_empty_mountpoint failed");
+
+        // Directory must still exist, but must be completely empty
+        assert!(temp_dir.exists());
+        let entries: Vec<_> = std::fs::read_dir(&temp_dir)
+            .expect("read_dir failed")
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_htpasswd_line() {
+        let line = generate_htpasswd_line("mycloud", "password");
+        assert_eq!(line, "mycloud:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n");
+    }
+
+    #[test]
+    fn test_write_htpasswd_file() {
+        let existing_kw = read_kwallet_webdav_password("mycloud", "127.0.0.1:8765", "127.0.0.1:8766");
+        let path = write_htpasswd_file("testuser", "testpass").expect("write htpasswd failed");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).expect("read htpasswd failed");
+        assert!(content.starts_with("testuser:{SHA}"));
+        if let Some(kw) = existing_kw {
+            let _ = write_htpasswd_file("mycloud", &kw);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restart_backoff_calculation() {
+        let opt = crate::config::OptimizationConfig::load_embedded();
+        let cfg = ProcessConfig {
+            rclone_bin: "true".to_string(),
+            rclone_remote: "drive:".to_string(),
+            rc_addr: "127.0.0.1:5572".to_string(),
+            vault_rc_addr: "127.0.0.1:5574".to_string(),
+            rc_user: "u".to_string(),
+            rc_pass: "p".to_string(),
+            raw_mount_path: PathBuf::from("/tmp/raw"),
+            target_mount_path: PathBuf::from("/tmp/target"),
+            fuse_bin: PathBuf::from("mycloud-fuse"),
+            config_path: PathBuf::from("/tmp/config.toml"),
+            webdav_addr: "127.0.0.1:8765".to_string(),
+            vault_webdav_addr: "127.0.0.1:8766".to_string(),
+            webdav_user: "u".to_string(),
+            webdav_pass: "p".to_string(),
+            htpasswd_path: PathBuf::from("/tmp/htpasswd"),
+            optimizations: opt,
+        };
+        let mut pm = ProcessManager::new(cfg, (0, 0), 0);
+        assert!(pm.can_attempt_restart());
+
+        let expected_delays = [
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(32),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ];
+
+        for expected in expected_delays {
+            let delay = pm.record_restart_attempt();
+            assert_eq!(delay, expected);
+            assert!(!pm.can_attempt_restart());
+        }
+    }
+}

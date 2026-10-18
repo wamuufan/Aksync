@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=/lib64
+includedir=/usr/include
+
+Name: soup-3.0
+Description: libsoup
+Version: 3.4.0
+Requires: gio-2.0
+Libs: -L${libdir} -lsoup-3.0
+Cflags:
