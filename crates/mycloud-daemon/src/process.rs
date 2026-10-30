@@ -483,6 +483,11 @@ pub fn write_htpasswd_file(username: &str, password: &str) -> Result<PathBuf, st
     };
 
     std::fs::create_dir_all(&htpasswd_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&htpasswd_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let htpasswd_path = htpasswd_dir.join("webdav.htpasswd");
     let content = generate_htpasswd_line(username, password);
     std::fs::write(&htpasswd_path, content)?;
@@ -939,7 +944,6 @@ impl ProcessManager {
             let about_client = self.about_client.clone();
             let cached_quota = Arc::clone(&self.cached_quota);
             let last_about_attempt = Arc::clone(&self.last_about_attempt);
-            let config_path = self.config.config_path.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -1023,16 +1027,6 @@ impl ProcessManager {
                         used, total
                     );
                     *cached_quota.write().await = (used, total);
-                    let cfg_path = config_path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut cfg) = crate::config::DaemonConfig::load_from(&cfg_path) {
-                            if cfg.cached_storage_used != used || cfg.cached_storage_total != total {
-                                cfg.cached_storage_used = used;
-                                cfg.cached_storage_total = total;
-                                let _ = cfg.save_to(&cfg_path);
-                            }
-                        }
-                    });
                 } else {
                     warn!("Failed to fetch cloud storage quota; scheduling retry in 10s");
                     // On failure, schedule retry in 10 seconds instead of backing off 5 minutes
@@ -1082,7 +1076,6 @@ impl ProcessManager {
             let raw_path = self.config.raw_mount_path.clone();
             let target_path = self.config.target_mount_path.clone();
             let cached_files = Arc::clone(&self.cached_files_count);
-            let cfg_path = self.config.config_path.clone();
 
             tokio::task::spawn_blocking(move || {
                 // If count is already populated from config, skip expensive traversal of the 150GB remote mount
@@ -1096,12 +1089,6 @@ impl ProcessManager {
                     count_files_in_dir(&target_path)
                 };
                 cached_files.store(final_count, Ordering::Relaxed);
-                if let Ok(mut cfg) = crate::config::DaemonConfig::load_from(&cfg_path) {
-                    if cfg.cached_files_count != final_count {
-                        cfg.cached_files_count = final_count;
-                        let _ = cfg.save_to(&cfg_path);
-                    }
-                }
             });
         }
 

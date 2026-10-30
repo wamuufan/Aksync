@@ -833,7 +833,7 @@ impl FsInner {
     }
 
     /// Builds a FileAttr structure for a given inode and physical file metadata
-    pub fn build_file_attr(&self, ino: u64, raw_path: &Path, meta: &fs::Metadata) -> FileAttr {
+    pub fn build_file_attr(&self, ino: u64, _raw_path: &Path, meta: &fs::Metadata) -> FileAttr {
         let is_dir = meta.is_dir();
         let is_symlink = meta.file_type().is_symlink();
         let kind = if is_dir {
@@ -850,20 +850,10 @@ impl FsInner {
         } else if is_symlink {
             raw_size
         } else if raw_size >= (HEADER_SIZE_V3 as u64) {
-            let is_v3 = if let Ok(mut f) = File::open(raw_path) {
-                let mut magic = [0u8; 4];
-                f.read_exact(&mut magic).is_ok() && &magic == MAGIC_V3
-            } else {
-                false
-            };
-
-            if is_v3 {
-                CryptoEngine::calculate_plain_size_v3_checked(raw_size).unwrap_or(0)
-            } else {
-                CryptoEngine::calculate_plain_size(raw_size)
-            }
+            CryptoEngine::calculate_plain_size_v3_checked(raw_size)
+                .unwrap_or_else(|_| CryptoEngine::calculate_plain_size(raw_size))
         } else {
-            CryptoEngine::calculate_plain_size(raw_size)
+            0
         };
 
         let mtime = meta.modified().unwrap_or(UNIX_EPOCH);

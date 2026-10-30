@@ -115,14 +115,52 @@ impl DaemonConfig {
         Ok(config)
     }
 
-    /// Saves the current configuration to disk
+    /// Saves the current configuration to disk atomically with 0o600 permissions
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
 
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        let tmp_path = path.with_extension("toml.tmp");
+
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            let mut file = options.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
+
+        std::fs::rename(&tmp_path, path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+
         info!("Saved daemon configuration to {:?}", path);
         Ok(())
     }
@@ -430,6 +468,16 @@ mod tests {
         assert!(config.is_setup_complete());
 
         config.save_to(&config_path).expect("Failed to save config");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&config_path).expect("Failed to get config metadata");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            let dir_meta = std::fs::metadata(&temp_dir).expect("Failed to get temp_dir metadata");
+            assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+        }
+
         let loaded = DaemonConfig::load_from(&config_path).expect("Failed to load config");
 
         assert_eq!(loaded.rclone_remote, "mycloud_drive");

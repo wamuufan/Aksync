@@ -1,8 +1,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use tracing::{error, info, warn};
+
+static HOME_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct SyncRunGuard;
+
+impl Drop for SyncRunGuard {
+    fn drop(&mut self) {
+        HOME_SYNC_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn is_valid_sync_folder_rel_path(rel: &str) -> bool {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return false;
+    }
+    for comp in Path::new(trimmed).components() {
+        match comp {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncFolderInfo {
@@ -122,6 +149,15 @@ pub async fn execute_home_sync(
     rc_user: &str,
     rc_pass: &str,
 ) -> Result<(), String> {
+    if HOME_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        info!("Home sync is already in progress");
+        return Ok(());
+    }
+    let _guard = SyncRunGuard;
+
     if folders.is_empty() {
         info!("No home folders selected for sync. Skipping home sync execution.");
         return Ok(());
@@ -157,6 +193,14 @@ pub async fn execute_home_sync(
     );
 
     for rel_folder in folders {
+        if !is_valid_sync_folder_rel_path(rel_folder) {
+            warn!(
+                "Invalid relative sync folder path {:?}. Skipping.",
+                rel_folder
+            );
+            continue;
+        }
+
         let source_dir = home_path.join(rel_folder);
         if !source_dir.exists() || !source_dir.is_dir() {
             warn!(
@@ -228,6 +272,14 @@ pub async fn execute_home_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sync_folder_path_validation() {
+        assert!(is_valid_sync_folder_rel_path("Belgeler"));
+        assert!(!is_valid_sync_folder_rel_path("../etc"));
+        assert!(!is_valid_sync_folder_rel_path("/etc/passwd"));
+        assert!(!is_valid_sync_folder_rel_path("a/../../b"));
+    }
 
     #[tokio::test]
     async fn test_execute_home_sync_empty_folders() {

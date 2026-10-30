@@ -297,8 +297,8 @@ pub fn App() -> impl IntoView {
             let flds = tauri_bridge::get_sync_folders().await;
             set_sync_folders.set(flds);
 
-            set_sync_hidden_files.set(false);
-            let _ = tauri_bridge::set_sync_hidden_files(false).await;
+            let hidden = tauri_bridge::get_sync_hidden_files().await;
+            set_sync_hidden_files.set(hidden);
 
             if let Ok(creds) = tauri_bridge::get_drive_api_credentials().await {
                 set_custom_client_id.set(creds.client_id);

@@ -218,34 +218,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     process::update_kde_places(&webdav_user, &cli.webdav_addr, &cli.vault_webdav_addr);
 
-    // Derive master key from CLI args if provided (non-interactive runs)
+    // Derive master key from CLI args if provided (non-interactive runs, debug/dev builds only)
     let mut initial_master_key: Option<zeroize::Zeroizing<[u8; 32]>> = None;
-    if let Ok(mut hex) = std::env::var("MYCLOUD_KEY_HEX") {
-        if let Ok(bytes) = hex::decode(hex.trim()) {
-            if bytes.len() == 32 {
-                let mut arr = zeroize::Zeroizing::new([0u8; 32]);
-                arr.copy_from_slice(&bytes);
-                initial_master_key = Some(arr);
+    if cfg!(debug_assertions) {
+        if let Ok(mut hex) = std::env::var("MYCLOUD_KEY_HEX") {
+            if let Ok(bytes) = hex::decode(hex.trim()) {
+                if bytes.len() == 32 {
+                    let mut arr = zeroize::Zeroizing::new([0u8; 32]);
+                    arr.copy_from_slice(&bytes);
+                    initial_master_key = Some(arr);
+                }
             }
-        }
-        zeroize::Zeroize::zeroize(&mut hex);
-    } else if let Ok(mut pass) = std::env::var("MYCLOUD_PASSPHRASE") {
-        if let Some(ref salt_b64) = initial_config.vault_salt_base64 {
-            if let Ok(salt_bytes) =
-                base64::engine::general_purpose::STANDARD.decode(salt_b64.trim())
-            {
-                if let Ok(k) = mycloud_crypto::KeyDerivation::derive_key(&pass, &salt_bytes) {
-                    if let Some(ref w) = initial_config.wrapped_dmk {
-                        if let Ok(dmk) = mycloud_crypto::KeyDerivation::unwrap_key(&k, w) {
-                            initial_master_key = Some(dmk);
+            zeroize::Zeroize::zeroize(&mut hex);
+        } else if let Ok(mut pass) = std::env::var("MYCLOUD_PASSPHRASE") {
+            if let Some(ref salt_b64) = initial_config.vault_salt_base64 {
+                if let Ok(salt_bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(salt_b64.trim())
+                {
+                    if let Ok(k) = mycloud_crypto::KeyDerivation::derive_key(&pass, &salt_bytes) {
+                        if let Some(ref w) = initial_config.wrapped_dmk {
+                            if let Ok(dmk) = mycloud_crypto::KeyDerivation::unwrap_key(&k, w) {
+                                initial_master_key = Some(dmk);
+                            }
+                        } else {
+                            initial_master_key = Some(k);
                         }
-                    } else {
-                        initial_master_key = Some(k);
                     }
                 }
             }
+            zeroize::Zeroize::zeroize(&mut pass);
         }
-        zeroize::Zeroize::zeroize(&mut pass);
+    } else if std::env::var("MYCLOUD_KEY_HEX").is_ok() || std::env::var("MYCLOUD_PASSPHRASE").is_ok() {
+        warn!("Ignoring MYCLOUD_KEY_HEX / MYCLOUD_PASSPHRASE in release build for security");
+    }
+
+    if let Some(ref k) = initial_master_key {
+        ipc::mlock_key_slice(k);
     }
 
     let initial_state = if !is_setup_done {

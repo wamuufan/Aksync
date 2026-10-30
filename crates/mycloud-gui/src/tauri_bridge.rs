@@ -283,7 +283,6 @@ struct SetSyncHiddenFilesArgs {
     enabled: bool,
 }
 
-#[allow(dead_code)]
 pub async fn get_sync_hidden_files() -> bool {
     let empty_args = JsValue::from_str("{}");
     match tauri_invoke("get_sync_hidden_files", empty_args).await {

@@ -149,6 +149,25 @@ pub struct DaemonSharedState {
     pub rc_pass: String,
 }
 
+#[cfg(unix)]
+pub fn mlock_key_slice(key: &[u8; 32]) {
+    unsafe {
+        let _ = libc::mlock(key.as_ptr() as *const libc::c_void, key.len());
+    }
+}
+
+#[cfg(not(unix))]
+pub fn mlock_key_slice(_key: &[u8; 32]) {}
+
+fn generate_random_webdav_password() -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
 /// Unix Domain Socket (UDS) Server for IPC communication
 pub struct IpcServer {
     socket_path: PathBuf,
@@ -262,9 +281,13 @@ impl IpcServer {
                     IpcResponse::SyncFolders(folders)
                 }
                 Ok(IpcCommand::SetSyncFolders(folders)) => {
+                    let sanitized_folders: Vec<String> = folders
+                        .into_iter()
+                        .filter(|f| crate::home_sync::is_valid_sync_folder_rel_path(f))
+                        .collect();
                     let (rclone_bin, target_mount_path, is_unlocked, sync_hidden) = {
                         let mut cfg = state.daemon_config.write().await;
-                        cfg.selected_sync_folders = folders.clone();
+                        cfg.selected_sync_folders = sanitized_folders.clone();
                         let _ = cfg.save_to(&state.config_path);
                         (
                             state.rclone_bin.clone(),
@@ -274,11 +297,11 @@ impl IpcServer {
                         )
                     };
 
-                    info!("Updated selected home sync folders: {:?}", folders);
+                    info!("Updated selected home sync folders: {:?}", sanitized_folders);
 
                     if is_unlocked {
                         // Trigger an asynchronous background sync for the selected folders into the encrypted vault
-                        let folders_clone = folders.clone();
+                        let folders_clone = sanitized_folders.clone();
                         let sync_state = state.sync_state.clone();
                         let opt = state.optimizations.clone();
                         let rc_addr = state.rc_addr.clone();
@@ -302,7 +325,7 @@ impl IpcServer {
                         });
                     }
 
-                    IpcResponse::Ok(format!("Configured {} sync folders", folders.len()))
+                    IpcResponse::Ok(format!("Configured {} sync folders", sanitized_folders.len()))
                 }
                 Ok(IpcCommand::GetSyncHiddenFiles) => {
                     let sync_hidden = {
@@ -639,15 +662,20 @@ impl IpcServer {
         })
         .await;
 
-        let effective_webdav_pass = if state.rclone_bin != "true" {
-            crate::process::read_kwallet_webdav_password(
-                "mycloud",
-                &state.optimizations.process.webdav_bind_addr,
-                &state.optimizations.process.vault_webdav_bind_addr,
-            )
-            .unwrap_or_else(|| password.clone())
-        } else {
-            password.clone()
+        let effective_webdav_pass = {
+            let existing = state.daemon_config.read().await.webdav_password.clone();
+            if let Some(pass) = existing {
+                pass
+            } else if state.rclone_bin != "true" {
+                crate::process::read_kwallet_webdav_password(
+                    "mycloud",
+                    &state.optimizations.process.webdav_bind_addr,
+                    &state.optimizations.process.vault_webdav_bind_addr,
+                )
+                .unwrap_or_else(generate_random_webdav_password)
+            } else {
+                generate_random_webdav_password()
+            }
         };
         if state.rclone_bin != "true" {
             let _ = crate::process::write_htpasswd_file("mycloud", &effective_webdav_pass);
@@ -692,6 +720,9 @@ impl IpcServer {
         let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
         let is_complete = {
             let mut cfg = state.daemon_config.write().await;
+            if cfg.vault_initialized {
+                return IpcResponse::Err("Vault is already initialized".to_string());
+            }
             cfg.vault_initialized = true;
             cfg.vault_salt_base64 = Some(salt_b64);
             cfg.vault_verification_tag = Some(v_token);
@@ -705,7 +736,13 @@ impl IpcServer {
             cfg.is_setup_complete()
         };
 
-        *state.master_key.write().await = Some(dmk);
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
 
         if is_complete {
             let _ = state.sync_state.send(SyncState::Connecting);
@@ -745,7 +782,6 @@ impl IpcServer {
             }
         };
 
-        let mut webdav_candidate = password.clone();
         let pass_clone = password.clone();
         let kek_res = tokio::task::spawn_blocking(move || {
             let mut p = pass_clone;
@@ -759,11 +795,9 @@ impl IpcServer {
         let kek = match kek_res {
             Ok(Ok(k)) => k,
             Ok(Err(e)) => {
-                webdav_candidate.zeroize();
                 return IpcResponse::Err(format!("Key derivation failed: {e}"));
             }
             Err(e) => {
-                webdav_candidate.zeroize();
                 return IpcResponse::Err(format!("Task execution failed: {e}"));
             }
         };
@@ -772,7 +806,6 @@ impl IpcServer {
             let dmk = match KeyDerivation::unwrap_key(&kek, w_dmk) {
                 Ok(k) => k,
                 Err(_) => {
-                    webdav_candidate.zeroize();
                     return IpcResponse::Err("Invalid master password".to_string());
                 }
             };
@@ -780,12 +813,10 @@ impl IpcServer {
                 Some(ref token) => {
                     let engine = CryptoEngine::from_key(*dmk);
                     if !engine.verify_vault_token(token) {
-                        webdav_candidate.zeroize();
                         return IpcResponse::Err("Invalid master password".to_string());
                     }
                 }
                 None => {
-                    webdav_candidate.zeroize();
                     return IpcResponse::Err(
                         "Vault has no verification token (legacy vault); password cannot be verified safely.".to_string(),
                     );
@@ -798,12 +829,10 @@ impl IpcServer {
                 Some(ref token) => {
                     let engine = CryptoEngine::from_key(*kek);
                     if !engine.verify_vault_token(token) {
-                        webdav_candidate.zeroize();
                         return IpcResponse::Err("Invalid master password".to_string());
                     }
                 }
                 None => {
-                    webdav_candidate.zeroize();
                     return IpcResponse::Err(
                         "Vault has no verification token (legacy vault); password cannot be verified safely.".to_string(),
                     );
@@ -818,17 +847,21 @@ impl IpcServer {
             dmk
         };
 
-        let effective_webdav_pass = if state.rclone_bin != "true" {
-            crate::process::read_kwallet_webdav_password(
-                "mycloud",
-                &state.optimizations.process.webdav_bind_addr,
-                &state.optimizations.process.vault_webdav_bind_addr,
-            )
-            .unwrap_or_else(|| webdav_candidate.clone())
-        } else {
-            webdav_candidate.clone()
+        let effective_webdav_pass = {
+            let existing = state.daemon_config.read().await.webdav_password.clone();
+            if let Some(pass) = existing {
+                pass
+            } else if state.rclone_bin != "true" {
+                crate::process::read_kwallet_webdav_password(
+                    "mycloud",
+                    &state.optimizations.process.webdav_bind_addr,
+                    &state.optimizations.process.vault_webdav_bind_addr,
+                )
+                .unwrap_or_else(generate_random_webdav_password)
+            } else {
+                generate_random_webdav_password()
+            }
         };
-        webdav_candidate.zeroize();
 
         if state.rclone_bin != "true" {
             let _ = crate::process::write_htpasswd_file("mycloud", &effective_webdav_pass);
@@ -840,7 +873,13 @@ impl IpcServer {
             let _ = cfg.save_to(&state.config_path);
         }
 
-        *state.master_key.write().await = Some(dmk);
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
 
         let current_sync = state.sync_state.borrow().clone();
         if current_sync == SyncState::Locked {
@@ -982,7 +1021,13 @@ impl IpcServer {
             }
         }
 
-        *state.master_key.write().await = Some(dmk);
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
 
         IpcResponse::Ok("Master passphrase changed successfully".to_string())
     }
@@ -1090,7 +1135,13 @@ impl IpcServer {
             }
         }
 
-        *state.master_key.write().await = Some(dmk);
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
 
         let current_sync = state.sync_state.borrow().clone();
         if current_sync == SyncState::Locked {
@@ -1482,6 +1533,94 @@ mod tests {
 
         assert!(shared_state.master_key.read().await.is_none());
         assert_eq!(*shared_state.sync_state.borrow(), SyncState::Locked);
+
+        // Clean up
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+        let _ = std::fs::remove_file(&temp_sock);
+        let _ = std::fs::remove_file(&temp_cfg);
+    }
+
+    #[tokio::test]
+    async fn test_vault_password_never_stored_in_webdav_password() {
+        let temp_sock = std::env::temp_dir().join(format!(
+            "mycloud_ipc_test_pw_leak_{}.sock",
+            std::process::id()
+        ));
+        let temp_cfg = std::env::temp_dir().join(format!(
+            "mycloud_cfg_test_pw_leak_{}.toml",
+            std::process::id()
+        ));
+        let (sync_state_tx, _sync_state_rx) = watch::channel(SyncState::SetupRequired);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (app_shutdown_tx, _app_shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let test_daemon_cfg = DaemonConfig {
+            rclone_configured: true,
+            ..DaemonConfig::default()
+        };
+
+        let shared_state = Arc::new(DaemonSharedState {
+            sync_state: sync_state_tx,
+            rclone_pid: Arc::new(RwLock::new(Some(1234))),
+            fuse_pid: Arc::new(RwLock::new(Some(5678))),
+            raw_mount_path: Arc::new(RwLock::new(PathBuf::from("/tmp/raw"))),
+            target_mount_path: PathBuf::from("/tmp/target"),
+            config_path: temp_cfg.clone(),
+            daemon_config: Arc::new(RwLock::new(test_daemon_cfg)),
+            shutdown_sender: app_shutdown_tx,
+            rclone_stats: Arc::new(RwLock::new(TransferStatsPayload::default())),
+            rclone_bin: "true".to_string(),
+            master_key: Arc::new(RwLock::new(None)),
+            optimizations: crate::config::OptimizationConfig::default(),
+            rc_addr: "127.0.0.1:5572".to_string(),
+            rc_user: "mycloud".to_string(),
+            rc_pass: "testpass".to_string(),
+        });
+
+        let server = IpcServer::new(temp_sock.clone(), Arc::clone(&shared_state));
+        let server_shutdown_rx = shutdown_tx.subscribe();
+        let server_handle = tokio::spawn(async move {
+            server.run(server_shutdown_rx).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client = UnixStream::connect(&temp_sock)
+            .await
+            .expect("failed to connect to socket");
+        let (reader, mut writer) = client.split();
+        let mut buf_reader = BufReader::new(reader);
+        let mut response_line = String::new();
+
+        let master_pass = "SuperSecretMasterPass123!";
+        let init_req = serde_json::to_string(&IpcCommand::InitializeVault(master_pass.to_string()))
+            .unwrap()
+            + "\n";
+        writer.write_all(init_req.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        response_line.clear();
+        buf_reader.read_line(&mut response_line).await.unwrap();
+        let init_resp: IpcResponse = serde_json::from_str(response_line.trim()).unwrap();
+        match init_resp {
+            IpcResponse::Ok(msg) => assert!(msg.contains("Vault initialized successfully")),
+            _ => panic!("Expected Ok response from InitializeVault, got {:?}", init_resp),
+        }
+
+        // Read config.toml from disk
+        let raw_toml = std::fs::read_to_string(&temp_cfg).expect("Failed to read config.toml");
+        assert!(
+            !raw_toml.contains("SuperSecretMasterPass123!"),
+            "Plaintext master password leaked in config.toml!"
+        );
+
+        let loaded_cfg = DaemonConfig::load_from(&temp_cfg).expect("Failed to load config.toml");
+        let webdav_pw = loaded_cfg
+            .webdav_password
+            .expect("webdav_password must be present");
+        assert_ne!(webdav_pw, master_pass);
+        assert_eq!(webdav_pw.len(), 32);
 
         // Clean up
         let _ = shutdown_tx.send(());
