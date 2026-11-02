@@ -15,9 +15,17 @@ pub enum ConfigError {
     TomlDe(#[from] toml::de::Error),
 }
 
+fn default_vault_name() -> String {
+    "Vault".to_string()
+}
+
 /// Persistent daemon configuration stored in ~/.config/mycloud/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
+    /// Name of the active vault subfolder inside the remote `Aksync/` directory
+    #[serde(default = "default_vault_name")]
+    pub vault_name: String,
+
     /// Remote name configured in rclone (default: "mycloud_drive")
     pub rclone_remote: String,
 
@@ -78,6 +86,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         let opt = OptimizationConfig::load_embedded();
         Self {
+            vault_name: default_vault_name(),
             rclone_remote: "mycloud_drive".to_string(),
             rclone_configured: false,
             vault_salt_base64: None,

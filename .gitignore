@@ -54,6 +54,7 @@ rclone.conf
 *.recovery
 *.vault
 .aksync_diriv
+.aksync_vault.json
 *.name
 
 # 6. Runtime Sockets, Mount Directories, Caches & Logs

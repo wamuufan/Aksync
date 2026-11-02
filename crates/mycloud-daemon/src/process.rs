@@ -68,6 +68,35 @@ pub fn unmount_path_lazy(path: &Path) {
         .output();
 }
 
+/// Kills any stale processes binding or matching the specified port/pattern
+pub fn cleanup_stale_port_processes(port_or_pattern: &str) {
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", port_or_pattern])
+        .output();
+}
+
+/// Convenience helper to kill stale WebDAV and RC processes on ports 8765, 8766, 5572, 5573
+pub fn kill_stale_rclone_webdav() {
+    cleanup_stale_port_processes("8765");
+    cleanup_stale_port_processes("8766");
+    cleanup_stale_port_processes("5572");
+    cleanup_stale_port_processes("5573");
+    cleanup_stale_rclone_oauth();
+}
+
+/// Kills any stale `rclone config` or `rclone authorize` processes holding OAuth port 53682
+pub fn cleanup_stale_rclone_oauth() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "rclone config"])
+        .output();
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "rclone authorize"])
+        .output();
+    let _ = std::process::Command::new("fuser")
+        .args(["-k", "53682/tcp"])
+        .output();
+}
+
 /// Prepares a mountpoint directory, ensuring it is unmounted and completely empty.
 /// This prevents rclone and FUSE mounts from failing when --allow-non-empty is disabled.
 pub fn prepare_empty_mountpoint(path: &Path) -> Result<(), std::io::Error> {
@@ -115,25 +144,19 @@ pub fn prepare_empty_mountpoint(path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Ensures KDE Places / Solid assigns the 'folder-cloud' icon to the mount point
-/// Derives the device-specific vault folder name from USER and HOSTNAME (e.g. MyCloud_alice_workstation)
-pub fn get_device_vault_folder() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| {
-            let mut buf = [0u8; 64];
-            unsafe {
-                if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
-                    std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char)
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    "device".to_string()
-                }
-            }
-        });
-    format!("MyCloud_{}_{}", user, host)
+/// Returns the sanitized cloud folder path for a vault: `Aksync/<vault_name>`
+pub fn get_remote_vault_path(vault_name: &str) -> String {
+    let clean: String = vault_name
+        .trim()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .collect();
+    let final_name = if clean.trim().is_empty() {
+        "Vault"
+    } else {
+        clean.trim()
+    };
+    format!("Aksync/{}", final_name)
 }
 
 /// Ensures an address string binds strictly to localhost (127.0.0.1)
@@ -240,23 +263,132 @@ pub async fn wait_for_mount(
     })
 }
 
+/// Awaits until TCP address is accepting connections
+pub async fn wait_tcp_port_ready(addr: &str, timeout: Duration) -> bool {
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    warn!("TCP port ready check timed out for address: {}", addr);
+    false
+}
+
+pub fn expand_cache_dir(name: &str) -> PathBuf {
+    let base = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("mycloud")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".cache/mycloud")
+    } else {
+        std::env::temp_dir().join("mycloud")
+    };
+    let dir = base.join(name);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn get_gdrive_mount_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".local/share/mycloud/gdrive")
+    } else {
+        std::env::temp_dir().join("mycloud/gdrive")
+    }
+}
+
+fn remove_bookmarks_matching(content: &mut String, patterns: &[&str]) {
+    let mut i = 0;
+    while let Some(start_rel) = content[i..].find("<bookmark") {
+        let block_start = i + start_rel;
+        if let Some(end_rel) = content[block_start..].find("</bookmark>") {
+            let block_end = block_start + end_rel + "</bookmark>".len();
+            let final_end = if content[block_end..].starts_with('\n') {
+                block_end + 1
+            } else {
+                block_end
+            };
+            let block = &content[block_start..final_end];
+            let should_remove = patterns.iter().any(|&p| block.contains(p));
+            if should_remove {
+                content.drain(block_start..final_end);
+                continue;
+            } else {
+                i = final_end;
+            }
+        } else {
+            if let Some(xbel_pos) = content[block_start..].find("</xbel>") {
+                content.drain(block_start..(block_start + xbel_pos));
+            }
+            break;
+        }
+    }
+}
+
+fn update_gtk_bookmarks() {
+    if let Ok(home) = std::env::var("HOME") {
+        let gtk_dir = PathBuf::from(&home).join(".config/gtk-3.0");
+        let _ = std::fs::create_dir_all(&gtk_dir);
+        let bookmarks_path = gtk_dir.join("bookmarks");
+        let existing = std::fs::read_to_string(&bookmarks_path).unwrap_or_default();
+        let mut lines: Vec<String> = existing
+            .lines()
+            .filter(|line| {
+                !line.contains("mycloud")
+                    && !line.ends_with("Google Drive")
+                    && !line.ends_with("MyCloud")
+            })
+            .map(|s| s.to_string())
+            .collect();
+        lines.push(format!("file://{}/.local/share/mycloud/vault MyCloud", home));
+        let new_content = lines.join("\n") + "\n";
+        let _ = std::fs::write(&bookmarks_path, new_content);
+    }
+}
+
+fn remove_gtk_bookmarks() {
+    if let Ok(home) = std::env::var("HOME") {
+        let bookmarks_path = PathBuf::from(&home).join(".config/gtk-3.0/bookmarks");
+        if bookmarks_path.exists() {
+            if let Ok(existing) = std::fs::read_to_string(&bookmarks_path) {
+                let lines: Vec<&str> = existing
+                    .lines()
+                    .filter(|line| {
+                        !line.contains("mycloud")
+                            && !line.ends_with("Google Drive")
+                            && !line.ends_with("MyCloud")
+                    })
+                    .collect();
+                let new_content = if lines.is_empty() {
+                    String::new()
+                } else {
+                    lines.join("\n") + "\n"
+                };
+                let _ = std::fs::write(&bookmarks_path, new_content);
+            }
+        }
+    }
+}
+
 /// Registers the WebDAV flat network drive and MyCloud Vault in KDE Dolphin Places cleanly under Uzak Konum
 pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr: &str) {
     if let Ok(home) = std::env::var("HOME") {
         let xbel_path = PathBuf::from(&home).join(".local/share/user-places.xbel");
         if !xbel_path.exists() {
-            return;
+            if let Some(parent) = xbel_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let empty_template = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xbel>\n<xbel xmlns:bookmark=\"http://www.freedesktop.org/standards/desktop-bookmarks\" xmlns:kdepriv=\"http://www.kde.org/kdepriv\" xmlns:mime=\"http://www.freedesktop.org/standards/shared-mime-info\">\n</xbel>\n";
+            let _ = std::fs::write(&xbel_path, empty_template);
         }
 
         if let Ok(content) = std::fs::read_to_string(&xbel_path) {
-            let orig_len = content.len();
             let mut cleaned = content;
             let stale_udis = [
                 format!("{}/.cache/mycloud/Google Drive", home),
                 format!("{}/.cache/mycloud/raw_mount", home),
                 format!("{}/.cache/mycloud/raw_vault", home),
                 format!("{}/MyCloud", home),
-                format!("{}/.local/share/mycloud/vault", home),
             ];
             for stale in &stale_udis {
                 while let Some(pos) = cleaned.find(stale.as_str()) {
@@ -284,13 +416,40 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                 }
             }
 
-            let gdrive_url = format!("webdav://{}@{}/", webdav_user, webdav_addr);
-            let vault_url = format!("webdav://{}@{}/", webdav_user, vault_webdav_addr);
+            let stale_webdav_patterns = [
+                "mycloud-gdrive-webdav",
+                "mycloud-vault-webdav",
+                "mycloud-vault-storage",
+                "webdav://127.0.0.1:8765",
+                "webdav://127.0.0.1:8766",
+                "webdav://mycloud@127.0.0.1:8765",
+                "webdav://mycloud@127.0.0.1:8766",
+                "webdav://mycloud@",
+                ".local/share/mycloud/gdrive",
+                ".local/share/mycloud/vault",
+                "<title>Google Drive</title>",
+                "<title>MyCloud</title>",
+            ];
+            remove_bookmarks_matching(&mut cleaned, &stale_webdav_patterns);
+
+            let gdrive_bind = ensure_localhost_addr(webdav_addr);
+            let vault_bind = ensure_localhost_addr(vault_webdav_addr);
+
+            let gdrive_url = if webdav_user.is_empty() {
+                format!("webdav://{}/", gdrive_bind)
+            } else {
+                format!("webdav://{}@{}/", webdav_user, gdrive_bind)
+            };
+
+            let vault_url = if webdav_user.is_empty() {
+                format!("webdav://{}/", vault_bind)
+            } else {
+                format!("webdav://{}@{}/", webdav_user, vault_bind)
+            };
 
             let mut additions = String::new();
 
             let uid = unsafe { libc::getuid() };
-            // Ensure raw_vault is hidden in KDE Solid / Dolphin
             let runtime_udi = if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
                 format!("/org/kde/fstab/fuse.rclone{}/mycloud/raw_vault", rt)
             } else {
@@ -300,14 +459,21 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
             let home_raw_vault_udi = format!("/org/kde/fstab/fuse.rclone{}/.cache/mycloud/raw_vault", home);
             let run_uid_udi = format!("/org/kde/fstab/fuse.rclone/run/user/{}/mycloud/raw_vault", uid);
 
+            let gdrive_fuse_udi = format!("/org/kde/fstab/fuse.rclone{}/.local/share/mycloud/gdrive", home);
+            let vault_fuse_mycloud_udi = format!("/org/kde/fstab/fuse.mycloud{}/.local/share/mycloud/vault", home);
+            let vault_fuse_udi = format!("/org/kde/fstab/fuse{}/.local/share/mycloud/vault", home);
+
             let hide_targets = [
                 home_raw_vault_udi.as_str(),
                 run_uid_udi.as_str(),
                 runtime_udi.as_str(),
+                gdrive_fuse_udi.as_str(),
+                vault_fuse_mycloud_udi.as_str(),
+                vault_fuse_udi.as_str(),
             ];
 
             for target in &hide_targets {
-                if !cleaned.contains(*target) {
+                if !cleaned.contains(target) {
                     additions.push_str(&format!(
                         " <separator>\n  <info>\n   <metadata owner=\"http://www.kde.org\">\n    <UDI>{}</UDI>\n    <isSystemItem>true</isSystemItem>\n    <IsHidden>true</IsHidden>\n   </metadata>\n  </info>\n </separator>\n",
                         target
@@ -315,29 +481,23 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                 }
             }
 
-            if !cleaned.contains(&gdrive_url) {
-                additions.push_str(&format!(
-                    " <bookmark href=\"{}\">\n  <title>Google Drive</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"folder-cloud\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-gdrive-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n   </metadata>\n  </info>\n </bookmark>\n",
-                    gdrive_url
-                ));
-            }
+            additions.push_str(&format!(
+                " <bookmark href=\"{}\">\n  <title>Google Drive</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"folder-cloud\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-gdrive-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n    <IsHidden>false</IsHidden>\n   </metadata>\n  </info>\n </bookmark>\n",
+                gdrive_url
+            ));
 
-            if !cleaned.contains(&vault_url) {
-                additions.push_str(&format!(
-                    " <bookmark href=\"{}\">\n  <title>MyCloud</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"security-high\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-vault-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n   </metadata>\n  </info>\n </bookmark>\n",
-                    vault_url
-                ));
-            }
+            additions.push_str(&format!(
+                " <bookmark href=\"{}\">\n  <title>MyCloud</title>\n  <info>\n   <metadata owner=\"http://freedesktop.org\">\n    <bookmark:icon name=\"security-high\"/>\n   </metadata>\n   <metadata owner=\"http://www.kde.org\">\n    <ID>mycloud-vault-webdav</ID>\n    <isSystemItem>false</isSystemItem>\n    <IsHidden>false</IsHidden>\n   </metadata>\n  </info>\n </bookmark>\n",
+                vault_url
+            ));
 
-            if !additions.is_empty() {
-                if let Some(pos) = cleaned.rfind("</xbel>") {
-                    cleaned.insert_str(pos, &additions);
-                    let _ = std::fs::write(&xbel_path, cleaned);
-                }
-            } else if cleaned.len() != orig_len {
+            if let Some(pos) = cleaned.rfind("</xbel>") {
+                cleaned.insert_str(pos, &additions);
                 let _ = std::fs::write(&xbel_path, cleaned);
             }
         }
+
+        update_gtk_bookmarks();
     }
 }
 
@@ -345,49 +505,45 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
 pub fn remove_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr: &str) {
     if let Ok(home) = std::env::var("HOME") {
         let xbel_path = PathBuf::from(&home).join(".local/share/user-places.xbel");
-        if !xbel_path.exists() {
-            return;
-        }
+        if xbel_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&xbel_path) {
+                let mut cleaned = content;
+                let gdrive_bind = ensure_localhost_addr(webdav_addr);
+                let vault_bind = ensure_localhost_addr(vault_webdav_addr);
+                let gdrive_url = format!("webdav://{}@{}/", webdav_user, gdrive_bind);
+                let vault_url = format!("webdav://{}@{}/", webdav_user, vault_bind);
+                let old_gdrive_url = format!("webdav://{}/", gdrive_bind);
+                let old_vault_url = format!("webdav://{}/", vault_bind);
+                let gdrive_file_url = format!("file://{}/.local/share/mycloud/gdrive", home);
+                let vault_file_url = format!("file://{}/.local/share/mycloud/vault", home);
 
-        if let Ok(content) = std::fs::read_to_string(&xbel_path) {
-            let mut cleaned = content;
-            let gdrive_url = format!("webdav://{}@{}/", webdav_user, webdav_addr);
-            let vault_url = format!("webdav://{}@{}/", webdav_user, vault_webdav_addr);
-            let old_gdrive_url = format!("webdav://{}/", webdav_addr);
-            let old_vault_url = format!("webdav://{}/", vault_webdav_addr);
+                let stale_patterns = [
+                    gdrive_url.as_str(),
+                    vault_url.as_str(),
+                    old_gdrive_url.as_str(),
+                    old_vault_url.as_str(),
+                    gdrive_file_url.as_str(),
+                    vault_file_url.as_str(),
+                    "webdav://mycloud@127.0.0.1:8765/",
+                    "webdav://mycloud@127.0.0.1:8766/",
+                    "webdav://127.0.0.1:8765/",
+                    "webdav://127.0.0.1:8766/",
+                    "webdav://mycloud@",
+                    "mycloud-gdrive-webdav",
+                    "mycloud-vault-webdav",
+                    "mycloud-vault-storage",
+                    ".local/share/mycloud/gdrive",
+                    ".local/share/mycloud/vault",
+                    "<title>Google Drive</title>",
+                    "<title>MyCloud</title>",
+                ];
 
-            let stale_patterns = [
-                gdrive_url.as_str(),
-                vault_url.as_str(),
-                old_gdrive_url.as_str(),
-                old_vault_url.as_str(),
-                "webdav://127.0.0.1:8765/",
-                "webdav://127.0.0.1:8766/",
-                "mycloud-gdrive-webdav",
-                "mycloud-vault-webdav",
-                "mycloud-vault-storage",
-            ];
-
-            for pattern in &stale_patterns {
-                while let Some(pos) = cleaned.find(pattern) {
-                    if let Some(block_start) = cleaned[..pos].rfind("<bookmark") {
-                        if let Some(block_end) = cleaned[pos..].find("</bookmark>") {
-                            let end_idx = pos + block_end + "</bookmark>".len();
-                            let final_end = if cleaned[end_idx..].starts_with('\n') {
-                                end_idx + 1
-                            } else {
-                                end_idx
-                            };
-                            cleaned.drain(block_start..final_end);
-                            continue;
-                        }
-                    }
-                    break;
-                }
+                remove_bookmarks_matching(&mut cleaned, &stale_patterns);
+                let _ = std::fs::write(&xbel_path, cleaned);
             }
-
-            let _ = std::fs::write(&xbel_path, cleaned);
         }
+
+        remove_gtk_bookmarks();
     }
 }
 
@@ -538,6 +694,7 @@ pub fn read_kwallet_webdav_password(
 /// Configuration options for spawning rclone and FUSE processes
 #[derive(Debug, Clone)]
 pub struct ProcessConfig {
+    pub vault_name: String,
     pub rclone_bin: String,
     pub rclone_remote: String,
     pub rc_addr: String,
@@ -580,7 +737,10 @@ pub struct ProcessManager {
 impl ProcessManager {
     pub fn set_remote(&mut self, remote: String) {
         self.config.rclone_remote = remote;
-        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+    }
+
+    pub fn set_vault_name(&mut self, vault_name: String) {
+        self.config.vault_name = vault_name;
     }
 
     pub fn raw_mount_path(&self) -> &std::path::Path {
@@ -664,7 +824,15 @@ impl ProcessManager {
 
     /// Spawns rclone WebDAV server providing flat network access to Google Drive for Dolphin
     pub async fn spawn_webdav(&mut self) -> Result<u32, ProcessError> {
-        self.refresh_htpasswd_from_kwallet();
+        cleanup_stale_port_processes(&self.config.webdav_addr);
+
+        let has_pass = std::env::var("MYCLOUD_WEBDAV_PASS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+        if has_pass {
+            self.refresh_htpasswd_from_kwallet();
+        }
 
         let remote_spec = if self.config.rclone_remote.ends_with(':') {
             self.config.rclone_remote.clone()
@@ -672,24 +840,34 @@ impl ProcessManager {
             format!("{}:", self.config.rclone_remote)
         };
 
+        // Start WebDAV server on 127.0.0.1:8765
         let bind_addr = ensure_localhost_addr(&self.config.webdav_addr);
         info!(
             "Spawning rclone serve webdav for remote '{}' on {}",
             remote_spec, bind_addr
         );
 
+        let webdav_cache = expand_cache_dir("rclone_webdav_gdrive");
         let mut cmd = Command::new(&self.config.rclone_bin);
         cmd.arg("serve")
             .arg("webdav")
             .arg(&remote_spec)
             .arg("--addr")
             .arg(&bind_addr)
-            .arg("--htpasswd")
-            .arg(&self.config.htpasswd_path)
-            .arg("--realm")
-            .arg("MyCloud")
-            .arg("--vfs-cache-mode")
+            .arg("--cache-dir")
+            .arg(&webdav_cache);
+
+        if has_pass {
+            cmd.arg("--htpasswd")
+                .arg(&self.config.htpasswd_path)
+                .arg("--realm")
+                .arg("MyCloud");
+        }
+
+        cmd.arg("--vfs-cache-mode")
             .arg(&self.config.optimizations.vfs.cache_mode)
+            .arg("--vfs-write-back")
+            .arg("1s")
             .arg("--vfs-cache-max-size")
             .arg(&self.config.optimizations.vfs.cache_max_size)
             .arg("--vfs-cache-max-age")
@@ -724,25 +902,52 @@ impl ProcessManager {
         cmd.stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let child = cmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+        let mut child = cmd.spawn().map_err(|e| ProcessError::SpawnFailed {
             name: "rclone-webdav",
             source: e,
         })?;
 
         let pid = child.id().unwrap_or(0);
         info!("rclone serve webdav spawned with PID {}", pid);
+
+        if let Ok(Some(status)) = child.try_wait() {
+            warn!("rclone serve webdav exited prematurely with status: {}", status);
+        }
+
         self.webdav_child = Some(child);
 
-        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+        let ready = wait_tcp_port_ready(&bind_addr, Duration::from_secs(5)).await;
+        if !ready {
+            warn!("WebDAV port {} not ready within 5s", bind_addr);
+        }
+
+        let user = if has_pass {
+            self.config.webdav_user.as_str()
+        } else {
+            ""
+        };
+        update_kde_places(user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
 
         Ok(pid)
     }
 
     /// Spawns rclone subprocess mounting the device-specific vault folder
     pub async fn spawn_rclone(&mut self) -> Result<u32, ProcessError> {
+        cleanup_stale_port_processes(&self.config.rc_addr);
+
         let remote_clean = self.config.rclone_remote.trim_end_matches(':');
-        let vault_folder = get_device_vault_folder();
-        let vault_remote = format!("{}:{}/", remote_clean, vault_folder);
+        let vault_subpath = get_remote_vault_path(&self.config.vault_name);
+        let vault_remote = format!("{}:{}/", remote_clean, vault_subpath);
+
+        info!(
+            "Ensuring remote vault folder '{}' exists via rclone mkdir...",
+            vault_remote
+        );
+        let _ = Command::new(&self.config.rclone_bin)
+            .arg("mkdir")
+            .arg(&vault_remote)
+            .output()
+            .await;
 
         info!(
             "Spawning rclone mount subprocess for device vault '{}' to {:?}",
@@ -771,6 +976,8 @@ impl ProcessManager {
             .arg(&self.config.raw_mount_path)
             .arg("--vfs-cache-mode")
             .arg(&self.config.optimizations.vfs.cache_mode)
+            .arg("--vfs-write-back")
+            .arg("1s")
             .arg("--vfs-cache-max-size")
             .arg(&self.config.optimizations.vfs.cache_max_size)
             .arg("--vfs-cache-max-age")
@@ -1151,37 +1358,44 @@ impl ProcessManager {
             warn!("Failed to spawn Vault WebDAV server: {}", e);
         }
 
-        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
-
         Ok(pid)
     }
 
     /// Spawns rclone WebDAV server exposing decrypted MyCloud vault for Dolphin's Uzak Konum
     pub async fn spawn_vault_webdav(&mut self) -> Result<u32, ProcessError> {
-        self.refresh_htpasswd_from_kwallet();
+        cleanup_stale_port_processes(&self.config.vault_webdav_addr);
+        cleanup_stale_port_processes(&self.config.vault_rc_addr);
+
+        let has_pass = std::env::var("MYCLOUD_WEBDAV_PASS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+        if has_pass {
+            self.refresh_htpasswd_from_kwallet();
+        }
         let vault_bind_addr = ensure_localhost_addr(&self.config.vault_webdav_addr);
+        let vault_cache = expand_cache_dir("rclone_webdav_vault");
+
         let mut wcmd = Command::new(&self.config.rclone_bin);
         wcmd.arg("serve")
             .arg("webdav")
             .arg(&self.config.target_mount_path)
             .arg("--addr")
             .arg(&vault_bind_addr)
-            .arg("--htpasswd")
-            .arg(&self.config.htpasswd_path)
-            .arg("--realm")
-            .arg("MyCloud Vault")
-            .arg("--vfs-cache-mode")
-            .arg(&self.config.optimizations.vfs.cache_mode)
-            .arg("--vfs-cache-max-size")
-            .arg(&self.config.optimizations.vfs.cache_max_size)
-            .arg("--vfs-cache-max-age")
-            .arg(&self.config.optimizations.vfs.cache_max_age)
-            .arg("--vfs-read-chunk-size")
-            .arg(&self.config.optimizations.vfs.read_chunk_size)
-            .arg("--vfs-read-chunk-size-limit")
-            .arg(&self.config.optimizations.vfs.read_chunk_size_limit)
+            .arg("--cache-dir")
+            .arg(&vault_cache);
+
+        if has_pass {
+            wcmd.arg("--htpasswd")
+                .arg(&self.config.htpasswd_path)
+                .arg("--realm")
+                .arg("MyCloud Vault");
+        }
+
+        wcmd.arg("--vfs-cache-mode")
+            .arg("off")
             .arg("--dir-cache-time")
-            .arg(&self.config.optimizations.cache.dir_cache_time);
+            .arg("5s");
 
         if self.config.optimizations.network.no_checksum {
             wcmd.arg("--no-checksum");
@@ -1196,7 +1410,7 @@ impl ProcessManager {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let child = wcmd.spawn().map_err(|e| ProcessError::SpawnFailed {
+        let mut child = wcmd.spawn().map_err(|e| ProcessError::SpawnFailed {
             name: "vault-webdav",
             source: e,
         })?;
@@ -1206,9 +1420,25 @@ impl ProcessManager {
             pid,
             vault_bind_addr
         );
+
+        if let Ok(Some(status)) = child.try_wait() {
+            warn!("vault-webdav exited prematurely with status: {}", status);
+        }
+
         self.vault_webdav_child = Some(child);
         self.warm_vfs_cache();
-        update_kde_places(&self.config.webdav_user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+
+        let ready = wait_tcp_port_ready(&vault_bind_addr, Duration::from_secs(5)).await;
+        if !ready {
+            warn!("Vault WebDAV port {} not ready within 5s", vault_bind_addr);
+        }
+
+        let user = if has_pass {
+            self.config.webdav_user.as_str()
+        } else {
+            ""
+        };
+        update_kde_places(user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
         Ok(pid)
     }
 
@@ -1533,6 +1763,7 @@ mod tests {
     async fn test_restart_backoff_calculation() {
         let opt = crate::config::OptimizationConfig::load_embedded();
         let cfg = ProcessConfig {
+            vault_name: "Vault".to_string(),
             rclone_bin: "true".to_string(),
             rclone_remote: "drive:".to_string(),
             rc_addr: "127.0.0.1:5572".to_string(),
@@ -1568,5 +1799,46 @@ mod tests {
             assert_eq!(delay, expected);
             assert!(!pm.can_attempt_restart());
         }
+    }
+
+    #[test]
+    fn test_remove_bookmarks_matching() {
+        let mut xbel = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xbel>
+ <bookmark href="file:///home/user">
+  <title>Home</title>
+ </bookmark>
+ <bookmark href="webdav://127.0.0.1:8765/">
+  <title>Google Drive</title>
+  <info>
+   <metadata owner="http://www.kde.org">
+    <ID>mycloud-gdrive-webdav</ID>
+   </metadata>
+  </info>
+ </bookmark>
+ <separator>
+  <info>
+   <metadata owner="http://www.kde.org">
+    <UDI>dummy_separator</UDI>
+   </metadata>
+  </info>
+ </separator>
+ <bookmark href="webdav://127.0.0.1:8766/">
+  <title>MyCloud</title>
+  <info>
+   <metadata owner="http://www.kde.org">
+    <ID>mycloud-vault-webdav</ID>
+   </metadata>
+  </info>
+ </bookmark>
+</xbel>
+"#.to_string();
+
+        let stale_patterns = ["mycloud-gdrive-webdav", "mycloud-vault-webdav"];
+        remove_bookmarks_matching(&mut xbel, &stale_patterns);
+        assert!(xbel.contains("<title>Home</title>"));
+        assert!(xbel.contains("dummy_separator"));
+        assert!(!xbel.contains("Google Drive"));
+        assert!(!xbel.contains("MyCloud"));
     }
 }

@@ -700,6 +700,20 @@ impl Language {
         }
     }
 
+    pub fn settings_api_save_and_auth_btn(&self) -> &'static str {
+        match self {
+            Self::English => "Save & Authorize with Google",
+            Self::Turkish => "Kaydet ve Google ile Yetkilendir",
+        }
+    }
+
+    pub fn settings_api_reauth_hint(&self) -> &'static str {
+        match self {
+            Self::English => "Note: Changing Client ID or Secret requires re-authorizing with Google so your OAuth token matches the new API credentials.",
+            Self::Turkish => "Not: Özel API (Client ID / Secret) değiştirdiğinizde, OAuth anahtarının yeni API ile eşleşmesi için Google ile yeniden yetkilendirme yapılır.",
+        }
+    }
+
     pub fn settings_close_btn(&self) -> &'static str {
         match self {
             Self::English => "Done",
@@ -714,6 +728,90 @@ impl Language {
         }
     }
 
+    pub fn wizard_next_step_btn(&self) -> &'static str {
+        match self {
+            Self::English => "Next Step",
+            Self::Turkish => "Sonraki Adım",
+        }
+    }
+
+    pub fn wizard_connecting_drive(&self) -> &'static str {
+        match self {
+            Self::English => "Connecting to Drive...",
+            Self::Turkish => "Drive'a bağlanılıyor...",
+        }
+    }
+
+    pub fn wizard_scanning_vaults(&self) -> &'static str {
+        match self {
+            Self::English => "Scanning vaults on Google Drive...",
+            Self::Turkish => "Google Drive'daki kasalar taranıyor...",
+        }
+    }
+
+    pub fn wizard_existing_vault_title(&self) -> &'static str {
+        match self {
+            Self::English => "Existing Vault Detected",
+            Self::Turkish => "Mevcut Kasa Tespit Edildi",
+        }
+    }
+
+    pub fn wizard_existing_vault_desc(&self) -> &'static str {
+        match self {
+            Self::English => "An existing vault was found in your cloud. Enter its recovery key to link:",
+            Self::Turkish => "Bulutta daha önceden oluşturulmuş kasanız bulundu. Bağlamak için kurtarma anahtarınızı girin:",
+        }
+    }
+
+    pub fn wizard_verify_key_btn(&self) -> &'static str {
+        match self {
+            Self::English => "Verify Recovery Key",
+            Self::Turkish => "Kurtarma Anahtarını Doğrula",
+        }
+    }
+
+    pub fn wizard_key_verified_msg(&self) -> &'static str {
+        match self {
+            Self::English => "Recovery key verified! Now set a new password for this vault:",
+            Self::Turkish => "Kurtarma anahtarı doğrulandı! Şimdi bu kasa için yeni parolanızı belirleyin:",
+        }
+    }
+
+    pub fn wizard_link_vault_btn(&self) -> &'static str {
+        match self {
+            Self::English => "Link & Unlock Vault",
+            Self::Turkish => "Kasayı Bağla ve Aç",
+        }
+    }
+
+    pub fn wizard_create_new_expander(&self) -> &'static str {
+        match self {
+            Self::English => "Create a New Vault",
+            Self::Turkish => "Yeni Kasa Oluştur",
+        }
+    }
+
+    pub fn wizard_vault_name_placeholder(&self) -> &'static str {
+        match self {
+            Self::English => "Vault Name (e.g. Personal)",
+            Self::Turkish => "Kasa Adı (örn. Kisisel)",
+        }
+    }
+
+    pub fn wizard_vault_name_empty(&self) -> &'static str {
+        match self {
+            Self::English => "Please enter a vault name.",
+            Self::Turkish => "Lütfen bir kasa adı girin.",
+        }
+    }
+
+    pub fn wizard_step3_badge(&self) -> &'static str {
+        match self {
+            Self::English => "Step 3: Backup Recovery Key",
+            Self::Turkish => "3. Adım: Kurtarma Anahtarını Yedekle",
+        }
+    }
+
     pub fn wizard_recovery_desc(&self) -> &'static str {
         match self {
             Self::English => "This 52-character key is the ONLY way to recover your vault if you forget your master password. Store it safely:",
@@ -723,8 +821,36 @@ impl Language {
 
     pub fn wizard_recovery_confirm_btn(&self) -> &'static str {
         match self {
-            Self::English => "I Saved the Key, Launch Vault",
-            Self::Turkish => "Anahtarı Kaydettim, Kasayı Aç",
+            Self::English => "I'm Ready",
+            Self::Turkish => "Hazırım",
+        }
+    }
+
+    pub fn wizard_recovery_countdown_btn(&self, secs: u8) -> String {
+        match self {
+            Self::English => format!("Please save your key! ({})", secs),
+            Self::Turkish => format!("Anahtarınızı lütfen kaydedin! ({})", secs),
+        }
+    }
+
+    pub fn wizard_copy_key_btn(&self) -> &'static str {
+        match self {
+            Self::English => "Copy Recovery Key",
+            Self::Turkish => "Anahtarı Kopyala",
+        }
+    }
+
+    pub fn wizard_key_copied_btn(&self) -> &'static str {
+        match self {
+            Self::English => "✓ Copied to Clipboard!",
+            Self::Turkish => "✓ Panoya Kopyalandı!",
+        }
+    }
+
+    pub fn wizard_advanced_api_expander(&self) -> &'static str {
+        match self {
+            Self::English => "Advanced (Custom Google Drive API)",
+            Self::Turkish => "Gelişmiş (Özel Google Drive API)",
         }
     }
 

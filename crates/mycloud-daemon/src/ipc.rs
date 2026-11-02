@@ -68,6 +68,32 @@ pub struct DriveApiCredentialsPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudVaultMetadata {
+    pub vault_name: String,
+    pub wrapped_dmk_recovery: String,
+    pub vault_verification_tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InitVaultRequest {
+    pub vault_name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyRecoveryKeyPayload {
+    pub vault_name: String,
+    pub recovery_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoverCloudVaultPayload {
+    pub vault_name: String,
+    pub recovery_key: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangePassphrasePayload {
     pub current_password: String,
     pub new_password: String,
@@ -100,6 +126,10 @@ pub enum IpcCommand {
     SetDriveApiCredentials(DriveApiCredentialsPayload),
     TriggerDriveAuth,
     InitializeVault(String),
+    InitializeVaultWithConfig(InitVaultRequest),
+    ListRemoteVaults,
+    VerifyCloudVaultRecoveryKey(VerifyRecoveryKeyPayload),
+    RecoverCloudVault(RecoverCloudVaultPayload),
     UnlockVault(String),
     ChangePassphrase(ChangePassphrasePayload),
     RecoverVault(RecoverVaultPayload),
@@ -125,6 +155,7 @@ pub enum IpcResponse {
     SyncFolders(Vec<crate::home_sync::SyncFolderInfo>),
     SyncHiddenFiles(bool),
     DriveApiCredentials(DriveApiCredentialsPayload),
+    RemoteVaults(Vec<String>),
     Ok(String),
     Err(String),
 }
@@ -469,6 +500,11 @@ impl IpcServer {
                         )
                     };
 
+                    if state.rclone_bin != "true" {
+                        crate::process::cleanup_stale_rclone_oauth();
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+
                     info!("Triggering rclone OAuth for remote '{}'", remote_name);
                     let mut cmd = Command::new(&state.rclone_bin);
                     cmd.arg("config")
@@ -527,6 +563,18 @@ impl IpcServer {
                 }
                 Ok(IpcCommand::InitializeVault(password)) => {
                     Self::handle_initialize_vault(&state, password).await
+                }
+                Ok(IpcCommand::InitializeVaultWithConfig(req)) => {
+                    Self::handle_initialize_vault_with_config(&state, req).await
+                }
+                Ok(IpcCommand::ListRemoteVaults) => {
+                    Self::handle_list_remote_vaults(&state).await
+                }
+                Ok(IpcCommand::VerifyCloudVaultRecoveryKey(payload)) => {
+                    Self::handle_verify_cloud_vault_recovery_key(&state, payload).await
+                }
+                Ok(IpcCommand::RecoverCloudVault(payload)) => {
+                    Self::handle_recover_cloud_vault(&state, payload).await
                 }
                 Ok(IpcCommand::UnlockVault(password)) => {
                     Self::handle_unlock_vault(&state, password).await
@@ -631,6 +679,434 @@ impl IpcServer {
         Ok(())
     }
 
+    async fn upload_vault_metadata(
+        state: &Arc<DaemonSharedState>,
+        vault_name: &str,
+        meta: &CloudVaultMetadata,
+    ) -> Result<(), String> {
+        if state.rclone_bin == "true" {
+            return Ok(());
+        }
+
+        let remote_clean = state
+            .daemon_config
+            .read()
+            .await
+            .rclone_remote
+            .trim_end_matches(':')
+            .to_string();
+        let vault_subpath = crate::process::get_remote_vault_path(vault_name);
+        let target_remote = format!("{}:{}/.aksync_vault.json", remote_clean, vault_subpath);
+
+        let pid = std::process::id();
+        let rand_val = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = format!("/tmp/.aksync_vault_{}_{}.json", pid, rand_val);
+
+        let json_bytes = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
+        tokio::fs::write(&tmp_path, &json_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        info!("Uploading cloud vault metadata to '{}'", target_remote);
+        let mut cmd = Command::new(&state.rclone_bin);
+        cmd.arg("copyto").arg(&tmp_path).arg(&target_remote);
+
+        let output_res = cmd.output().await;
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+
+        match output_res {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                warn!("rclone copyto metadata failed: {}", err);
+                Err(err.trim().to_string())
+            }
+            Err(e) => {
+                warn!("Failed to execute rclone for metadata copy: {}", e);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    async fn fetch_cloud_vault_metadata(
+        state: &Arc<DaemonSharedState>,
+        vault_name: &str,
+    ) -> Result<CloudVaultMetadata, String> {
+        if state.rclone_bin == "true" {
+            return Err("Mock rclone environment: cannot fetch cloud vault metadata".to_string());
+        }
+
+        let remote_clean = state
+            .daemon_config
+            .read()
+            .await
+            .rclone_remote
+            .trim_end_matches(':')
+            .to_string();
+        let vault_subpath = crate::process::get_remote_vault_path(vault_name);
+        let meta_remote = format!("{}:{}/.aksync_vault.json", remote_clean, vault_subpath);
+
+        let output = Command::new(&state.rclone_bin)
+            .arg("cat")
+            .arg(&meta_remote)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute rclone cat: {}", e))?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Cloud vault metadata not found or inaccessible: {}",
+                err.trim()
+            ));
+        }
+
+        serde_json::from_slice::<CloudVaultMetadata>(&output.stdout)
+            .map_err(|e| format!("Invalid cloud vault metadata format: {}", e))
+    }
+
+    async fn handle_list_remote_vaults(state: &Arc<DaemonSharedState>) -> IpcResponse {
+        if state.rclone_bin == "true" {
+            return IpcResponse::RemoteVaults(vec![]);
+        }
+
+        let remote_clean = state
+            .daemon_config
+            .read()
+            .await
+            .rclone_remote
+            .trim_end_matches(':')
+            .to_string();
+        let aksync_remote = format!("{}:Aksync", remote_clean);
+
+        // 1. Ensure remote Aksync directory exists
+        let _ = Command::new(&state.rclone_bin)
+            .arg("mkdir")
+            .arg(&aksync_remote)
+            .output()
+            .await;
+
+        // 2. List directories inside Aksync/
+        let output = Command::new(&state.rclone_bin)
+            .arg("lsf")
+            .arg("--dirs-only")
+            .arg(&aksync_remote)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let vaults: Vec<String> = text
+                    .lines()
+                    .map(|l| l.trim().trim_end_matches('/').to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                IpcResponse::RemoteVaults(vaults)
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                warn!("rclone lsf failed: {}", err);
+                IpcResponse::RemoteVaults(vec![])
+            }
+            Err(e) => {
+                warn!("Failed to execute rclone lsf: {}", e);
+                IpcResponse::RemoteVaults(vec![])
+            }
+        }
+    }
+
+    async fn handle_verify_cloud_vault_recovery_key(
+        state: &Arc<DaemonSharedState>,
+        mut payload: VerifyRecoveryKeyPayload,
+    ) -> IpcResponse {
+        let meta = match Self::fetch_cloud_vault_metadata(state, &payload.vault_name).await {
+            Ok(m) => m,
+            Err(e) => {
+                payload.recovery_key.zeroize();
+                return IpcResponse::Err(e);
+            }
+        };
+
+        let rec_kek = match KeyDerivation::derive_kek_from_recovery(&payload.recovery_key) {
+            Ok(k) => k,
+            Err(_) => {
+                payload.recovery_key.zeroize();
+                return IpcResponse::Err("Invalid recovery key".to_string());
+            }
+        };
+        payload.recovery_key.zeroize();
+
+        let dmk = match KeyDerivation::unwrap_key(&rec_kek, &meta.wrapped_dmk_recovery) {
+            Ok(k) => k,
+            Err(_) => {
+                return IpcResponse::Err("Invalid recovery key".to_string());
+            }
+        };
+
+        let engine = CryptoEngine::from_key(*dmk);
+        if !engine.verify_vault_token(&meta.vault_verification_tag) {
+            return IpcResponse::Err("Invalid recovery key".to_string());
+        }
+
+        IpcResponse::Ok("Recovery key verified".to_string())
+    }
+
+    async fn handle_recover_cloud_vault(
+        state: &Arc<DaemonSharedState>,
+        mut payload: RecoverCloudVaultPayload,
+    ) -> IpcResponse {
+        if payload.new_password.trim().len() < 8 {
+            payload.recovery_key.zeroize();
+            payload.new_password.zeroize();
+            return IpcResponse::Err(
+                "New master password must be at least 8 characters long".to_string(),
+            );
+        }
+
+        let meta = match Self::fetch_cloud_vault_metadata(state, &payload.vault_name).await {
+            Ok(m) => m,
+            Err(e) => {
+                payload.recovery_key.zeroize();
+                payload.new_password.zeroize();
+                return IpcResponse::Err(e);
+            }
+        };
+
+        let rec_kek = match KeyDerivation::derive_kek_from_recovery(&payload.recovery_key) {
+            Ok(k) => k,
+            Err(_) => {
+                payload.recovery_key.zeroize();
+                payload.new_password.zeroize();
+                return IpcResponse::Err("Invalid recovery key".to_string());
+            }
+        };
+        payload.recovery_key.zeroize();
+
+        let dmk = match KeyDerivation::unwrap_key(&rec_kek, &meta.wrapped_dmk_recovery) {
+            Ok(k) => k,
+            Err(_) => {
+                payload.new_password.zeroize();
+                return IpcResponse::Err("Invalid recovery key".to_string());
+            }
+        };
+
+        let engine = CryptoEngine::from_key(*dmk);
+        if !engine.verify_vault_token(&meta.vault_verification_tag) {
+            payload.new_password.zeroize();
+            return IpcResponse::Err("Invalid recovery key".to_string());
+        }
+
+        let new_salt_bytes = KeyDerivation::generate_salt();
+        let new_salt_clone = new_salt_bytes;
+        let new_pass = payload.new_password.clone();
+        let new_kek_res = tokio::task::spawn_blocking(move || {
+            let mut p = new_pass;
+            let res = KeyDerivation::derive_key(&p, &new_salt_clone);
+            p.zeroize();
+            res
+        })
+        .await;
+        payload.new_password.zeroize();
+
+        let new_kek = match new_kek_res {
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => return IpcResponse::Err(format!("Key derivation failed: {e}")),
+            Err(e) => return IpcResponse::Err(format!("Task execution failed: {e}")),
+        };
+
+        let new_wrapped = match KeyDerivation::wrap_key(&new_kek, &dmk) {
+            Ok(w) => w,
+            Err(e) => return IpcResponse::Err(format!("Failed to wrap DMK: {e}")),
+        };
+
+        let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt_bytes);
+
+        let clean_subpath = crate::process::get_remote_vault_path(&payload.vault_name);
+        let vault_folder_name = clean_subpath.trim_start_matches("Aksync/").to_string();
+
+        let effective_webdav_pass = {
+            let existing = state.daemon_config.read().await.webdav_password.clone();
+            if let Some(pass) = existing {
+                pass
+            } else if state.rclone_bin != "true" {
+                crate::process::read_kwallet_webdav_password(
+                    "mycloud",
+                    &state.optimizations.process.webdav_bind_addr,
+                    &state.optimizations.process.vault_webdav_bind_addr,
+                )
+                .unwrap_or_else(generate_random_webdav_password)
+            } else {
+                generate_random_webdav_password()
+            }
+        };
+        if state.rclone_bin != "true" {
+            let _ = crate::process::write_htpasswd_file("mycloud", &effective_webdav_pass);
+        }
+
+        {
+            let mut cfg = state.daemon_config.write().await;
+            cfg.vault_name = vault_folder_name;
+            cfg.vault_initialized = true;
+            cfg.vault_salt_base64 = Some(new_salt_b64);
+            cfg.vault_verification_tag = Some(meta.vault_verification_tag.clone());
+            cfg.wrapped_dmk = Some(new_wrapped);
+            cfg.wrapped_dmk_recovery = Some(meta.wrapped_dmk_recovery.clone());
+            cfg.webdav_password = Some(effective_webdav_pass);
+            if let Err(e) = cfg.save_to(&state.config_path) {
+                return IpcResponse::Err(format!("Failed to save config: {e}"));
+            }
+        }
+
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
+
+        let _ = state.sync_state.send(SyncState::Connecting);
+        IpcResponse::Ok("Vault recovered and unlocked successfully".to_string())
+    }
+
+    async fn handle_initialize_vault_with_config(
+        state: &Arc<DaemonSharedState>,
+        mut req: InitVaultRequest,
+    ) -> IpcResponse {
+        let clean_subpath = crate::process::get_remote_vault_path(&req.vault_name);
+        let v_name = clean_subpath.trim_start_matches("Aksync/").to_string();
+
+        let is_already_init = {
+            let cfg = state.daemon_config.read().await;
+            cfg.vault_initialized
+        };
+        if is_already_init {
+            req.password.zeroize();
+            return IpcResponse::Err("Vault is already initialized".to_string());
+        }
+
+        if req.password.trim().len() < 8 {
+            req.password.zeroize();
+            return IpcResponse::Err(
+                "Master password must be at least 8 characters long".to_string(),
+            );
+        }
+
+        let salt_bytes = KeyDerivation::generate_salt();
+        let salt_clone = salt_bytes;
+        let pass_clone = req.password.clone();
+        let kek_res = tokio::task::spawn_blocking(move || {
+            let mut p = pass_clone;
+            let res = KeyDerivation::derive_key(&p, &salt_clone);
+            p.zeroize();
+            res
+        })
+        .await;
+
+        let effective_webdav_pass = {
+            let existing = state.daemon_config.read().await.webdav_password.clone();
+            if let Some(pass) = existing {
+                pass
+            } else if state.rclone_bin != "true" {
+                crate::process::read_kwallet_webdav_password(
+                    "mycloud",
+                    &state.optimizations.process.webdav_bind_addr,
+                    &state.optimizations.process.vault_webdav_bind_addr,
+                )
+                .unwrap_or_else(generate_random_webdav_password)
+            } else {
+                generate_random_webdav_password()
+            }
+        };
+        if state.rclone_bin != "true" {
+            let _ = crate::process::write_htpasswd_file("mycloud", &effective_webdav_pass);
+        }
+
+        req.password.zeroize();
+
+        let kek = match kek_res {
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => return IpcResponse::Err(format!("Key derivation failed: {e}")),
+            Err(e) => return IpcResponse::Err(format!("Task execution failed: {e}")),
+        };
+
+        let dmk = KeyDerivation::generate_master_key();
+
+        let wrapped_dmk = match KeyDerivation::wrap_key(&kek, &dmk) {
+            Ok(w) => w,
+            Err(e) => return IpcResponse::Err(format!("Failed to wrap DMK: {e}")),
+        };
+
+        let recovery_key = KeyDerivation::generate_recovery_key();
+        let rec_kek = match KeyDerivation::derive_kek_from_recovery(&recovery_key) {
+            Ok(k) => k,
+            Err(e) => {
+                return IpcResponse::Err(format!("Failed to derive KEK from recovery key: {e}"))
+            }
+        };
+
+        let wrapped_dmk_recovery = match KeyDerivation::wrap_key(&rec_kek, &dmk) {
+            Ok(w) => w,
+            Err(e) => {
+                return IpcResponse::Err(format!("Failed to wrap DMK with recovery key: {e}"))
+            }
+        };
+
+        let engine = CryptoEngine::from_key(*dmk);
+        let v_token = match engine.generate_vault_verification_token() {
+            Ok(t) => t,
+            Err(e) => return IpcResponse::Err(format!("Failed to generate vault token: {e}")),
+        };
+
+        // Upload cloud vault metadata
+        let meta = CloudVaultMetadata {
+            vault_name: v_name.clone(),
+            wrapped_dmk_recovery: wrapped_dmk_recovery.clone(),
+            vault_verification_tag: v_token.clone(),
+        };
+        if let Err(e) = Self::upload_vault_metadata(state, &v_name, &meta).await {
+            warn!("Failed to upload cloud vault metadata: {}", e);
+        }
+
+        let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
+        {
+            let mut cfg = state.daemon_config.write().await;
+            if cfg.vault_initialized {
+                return IpcResponse::Err("Vault is already initialized".to_string());
+            }
+            cfg.vault_name = v_name;
+            cfg.vault_initialized = true;
+            cfg.vault_salt_base64 = Some(salt_b64);
+            cfg.vault_verification_tag = Some(v_token);
+            cfg.wrapped_dmk = Some(wrapped_dmk);
+            cfg.wrapped_dmk_recovery = Some(wrapped_dmk_recovery);
+            cfg.webdav_password = Some(effective_webdav_pass);
+            cfg.sync_hidden_files = state.optimizations.sync.default_sync_hidden_files;
+            if let Err(e) = cfg.save_to(&state.config_path) {
+                return IpcResponse::Err(format!("Failed to save config: {e}"));
+            }
+        }
+
+        {
+            let mut guard = state.master_key.write().await;
+            *guard = Some(dmk);
+            if let Some(ref k) = *guard {
+                mlock_key_slice(k);
+            }
+        }
+
+        let _ = state.sync_state.send(SyncState::Locked);
+
+        IpcResponse::Ok(format!(
+            "Vault initialized successfully. Recovery Key: {}",
+            *recovery_key
+        ))
+    }
+
     async fn handle_initialize_vault(
         state: &Arc<DaemonSharedState>,
         mut password: String,
@@ -718,7 +1194,19 @@ impl IpcServer {
         };
 
         let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
-        let is_complete = {
+        let vault_name = {
+            let cfg = state.daemon_config.read().await;
+            cfg.vault_name.clone()
+        };
+        let meta = CloudVaultMetadata {
+            vault_name: vault_name.clone(),
+            wrapped_dmk_recovery: wrapped_dmk_recovery.clone(),
+            vault_verification_tag: v_token.clone(),
+        };
+        if let Err(e) = Self::upload_vault_metadata(state, &vault_name, &meta).await {
+            warn!("Failed to upload cloud vault metadata: {}", e);
+        }
+        let _is_complete = {
             let mut cfg = state.daemon_config.write().await;
             if cfg.vault_initialized {
                 return IpcResponse::Err("Vault is already initialized".to_string());
@@ -744,9 +1232,7 @@ impl IpcServer {
             }
         }
 
-        if is_complete {
-            let _ = state.sync_state.send(SyncState::Connecting);
-        }
+        let _ = state.sync_state.send(SyncState::Locked);
 
         IpcResponse::Ok(format!(
             "Vault initialized successfully. Recovery Key: {}",
@@ -1029,6 +1515,23 @@ impl IpcServer {
             }
         }
 
+        let (vault_name, rec_wrap, v_tok) = {
+            let cfg = state.daemon_config.read().await;
+            (
+                cfg.vault_name.clone(),
+                cfg.wrapped_dmk_recovery.clone().unwrap_or_default(),
+                cfg.vault_verification_tag.clone().unwrap_or_default(),
+            )
+        };
+        let meta = CloudVaultMetadata {
+            vault_name: vault_name.clone(),
+            wrapped_dmk_recovery: rec_wrap,
+            vault_verification_tag: v_tok,
+        };
+        if let Err(e) = Self::upload_vault_metadata(state, &vault_name, &meta).await {
+            warn!("Failed to upload cloud vault metadata: {}", e);
+        }
+
         IpcResponse::Ok("Master passphrase changed successfully".to_string())
     }
 
@@ -1146,6 +1649,23 @@ impl IpcServer {
         let current_sync = state.sync_state.borrow().clone();
         if current_sync == SyncState::Locked {
             let _ = state.sync_state.send(SyncState::Connecting);
+        }
+
+        let (vault_name, rec_wrap, v_tok) = {
+            let cfg = state.daemon_config.read().await;
+            (
+                cfg.vault_name.clone(),
+                cfg.wrapped_dmk_recovery.clone().unwrap_or_default(),
+                cfg.vault_verification_tag.clone().unwrap_or_default(),
+            )
+        };
+        let meta = CloudVaultMetadata {
+            vault_name: vault_name.clone(),
+            wrapped_dmk_recovery: rec_wrap,
+            vault_verification_tag: v_tok,
+        };
+        if let Err(e) = Self::upload_vault_metadata(state, &vault_name, &meta).await {
+            warn!("Failed to upload cloud vault metadata: {}", e);
         }
 
         IpcResponse::Ok("Vault recovered and passphrase updated successfully".to_string())

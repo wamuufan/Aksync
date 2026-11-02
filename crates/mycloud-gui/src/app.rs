@@ -262,7 +262,6 @@ pub fn App() -> impl IntoView {
     // Custom Google Drive API credentials
     let (custom_client_id, set_custom_client_id) = create_signal(String::new());
     let (custom_client_secret, set_custom_client_secret) = create_signal(String::new());
-    let (api_saving, set_api_saving) = create_signal(false);
     let (api_authorizing, set_api_authorizing) = create_signal(false);
     let (api_feedback_msg, set_api_feedback_msg) = create_signal(Option::<(bool, String)>::None);
 
@@ -279,11 +278,6 @@ pub fn App() -> impl IntoView {
             set_is_paused.set(paused);
 
             if matches!(st.state, SyncState::SetupRequired) {
-                if let Ok(setup_info) = tauri_bridge::check_setup_status().await {
-                    if setup_info.rclone_configured {
-                        set_step1_done.set(true);
-                    }
-                }
                 set_is_setup_done.set(false);
             } else {
                 set_is_setup_done.set(true);
@@ -322,12 +316,6 @@ pub fn App() -> impl IntoView {
                 let paused = matches!(st.state, SyncState::Paused);
                 if is_paused.get_untracked() != paused {
                     set_is_paused.set(paused);
-                }
-
-                if !matches!(st.state, SyncState::SetupRequired | SyncState::Offline)
-                    && !is_setup_done.get_untracked()
-                {
-                    set_is_setup_done.set(true);
                 }
 
                 set_status.set(st);
@@ -430,25 +418,6 @@ pub fn App() -> impl IntoView {
         });
     };
 
-    let on_save_api_credentials = move |_| {
-        let cid = custom_client_id.get();
-        let cs = custom_client_secret.get();
-        set_api_saving.set(true);
-        set_api_feedback_msg.set(None);
-        leptos::spawn_local(async move {
-            match tauri_bridge::set_drive_api_credentials(cid, cs).await {
-                Ok(_) => {
-                    set_api_saving.set(false);
-                    set_api_feedback_msg.set(Some((false, lang.get().settings_api_saved_msg().to_string())));
-                }
-                Err(e) => {
-                    set_api_saving.set(false);
-                    set_api_feedback_msg.set(Some((true, e)));
-                }
-            }
-        });
-    };
-
     let on_auth_with_api_credentials = move |_| {
         let cid = custom_client_id.get();
         let cs = custom_client_secret.get();
@@ -480,6 +449,12 @@ pub fn App() -> impl IntoView {
         leptos::spawn_local(async move {
             let fresh_st = tauri_bridge::get_sync_state().await;
             set_status.set(fresh_st);
+            if let Ok(creds) = tauri_bridge::get_drive_api_credentials().await {
+                set_custom_client_id.set(creds.client_id);
+                set_custom_client_secret.set(creds.client_secret);
+            }
+            let flds = tauri_bridge::get_sync_folders().await;
+            set_sync_folders.set(flds);
         });
     };
 
@@ -700,7 +675,7 @@ pub fn App() -> impl IntoView {
             // Durum A: SetupRequired / İlk Kurulum (Tam pencere ortalanmış kurulum görünümü)
             <div
                 class="centered-view-wrapper"
-                style=move || if is_initialized.get() && (!is_setup_done.get() || matches!(status.get().state, SyncState::SetupRequired)) {
+                style=move || if is_initialized.get() && !is_setup_done.get() {
                     "display: flex;"
                 } else {
                     "display: none;"
@@ -910,7 +885,15 @@ pub fn App() -> impl IntoView {
                         </button>
                         <button
                             class=move || if active_tab.get() == ActiveTab::AppSettings { "nav-item active" } else { "nav-item" }
-                            on:click=move |_| set_active_tab.set(ActiveTab::AppSettings)
+                            on:click=move |_| {
+                                set_active_tab.set(ActiveTab::AppSettings);
+                                leptos::spawn_local(async move {
+                                    if let Ok(creds) = tauri_bridge::get_drive_api_credentials().await {
+                                        set_custom_client_id.set(creds.client_id);
+                                        set_custom_client_secret.set(creds.client_secret);
+                                    }
+                                });
+                            }
                         >
                             <span class="nav-icon">
                                 <svg width="17" height="17" style="width: 1.15rem; height: 1.15rem;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1505,25 +1488,14 @@ pub fn App() -> impl IntoView {
                                         />
                                     </div>
 
-                                    <div style="display: flex; align-items: center; justify-content: flex-end; gap: 0.6rem; margin-top: 0.35rem;">
-                                        <button
-                                            class="btn"
-                                            disabled=move || api_saving.get()
-                                            on:click=on_save_api_credentials
-                                        >
-                                            {move || if api_saving.get() {
-                                                view! { <span class="spinner"></span> <span>{lang.get().settings_api_save_btn()}</span> }.into_view()
-                                            } else {
-                                                view! {
-                                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
-                                                    </svg>
-                                                    <span>{lang.get().settings_api_save_btn()}</span>
-                                                }.into_view()
-                                            }}
-                                        </button>
+                                    <p style="font-size: 0.78rem; color: var(--text-secondary); line-height: 1.4; margin-top: 0.25rem;">
+                                        {move || lang.get().settings_api_reauth_hint()}
+                                    </p>
+
+                                    <div style="display: flex; align-items: center; justify-content: flex-end; margin-top: 0.45rem;">
                                         <button
                                             class="btn btn-primary"
+                                            style="display: flex; align-items: center; gap: 0.45rem;"
                                             disabled=move || api_authorizing.get()
                                             on:click=on_auth_with_api_credentials
                                         >
@@ -1532,9 +1504,9 @@ pub fn App() -> impl IntoView {
                                             } else {
                                                 view! {
                                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>
+                                                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
                                                     </svg>
-                                                    <span>{lang.get().settings_api_auth_btn()}</span>
+                                                    <span>{lang.get().settings_api_save_and_auth_btn()}</span>
                                                 }.into_view()
                                             }}
                                         </button>

@@ -216,8 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webdav_user, htpasswd_path
     );
 
-    process::update_kde_places(&webdav_user, &cli.webdav_addr, &cli.vault_webdav_addr);
-
     // Derive master key from CLI args if provided (non-interactive runs, debug/dev builds only)
     let mut initial_master_key: Option<zeroize::Zeroizing<[u8; 32]>> = None;
     if cfg!(debug_assertions) {
@@ -263,6 +261,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SyncState::Locked
     };
+
+    if matches!(initial_state, SyncState::Locked | SyncState::SetupRequired) {
+        process::remove_kde_places(&webdav_user, &cli.webdav_addr, &cli.vault_webdav_addr);
+    }
 
     let (sync_state_tx, mut sync_state_rx) = watch::channel(initial_state.clone());
     let (ipc_shutdown_tx, _) = broadcast::channel::<()>(16);
@@ -312,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let process_config = ProcessConfig {
+        vault_name: initial_config.vault_name.clone(),
         rclone_bin: cli.rclone_bin.clone(),
         rclone_remote: initial_config.rclone_remote.clone(),
         rc_addr: cli.rc_addr.clone(),
@@ -342,6 +345,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(key) = key_opt {
             let mut rclone_ok = true;
             if !cli.skip_rclone {
+                if process_manager.webdav_pid().is_none() {
+                    if let Err(e) = process_manager.spawn_webdav().await {
+                        warn!("Failed to spawn rclone WebDAV: {}", e);
+                    }
+                }
                 match process_manager.spawn_rclone().await {
                     Ok(pid) => {
                         *rclone_pid_shared.write().await = Some(pid);
@@ -365,11 +373,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 process::apply_folder_freeze_prevention_rules(&raw_mount);
                             }
                             process_manager.warm_vfs_cache();
-                            if process_manager.webdav_pid().is_none() {
-                                if let Err(e) = process_manager.spawn_webdav().await {
-                                    warn!("Failed to spawn rclone WebDAV: {}", e);
-                                }
-                            }
                         }
                     }
                     Err(e) => {
@@ -568,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *rclone_pid_shared.write().await = None;
                         *fuse_pid_shared.write().await = None;
                     }
+                    process::remove_kde_places(&webdav_user, &cli.webdav_addr, &cli.vault_webdav_addr);
                 }
                 let needs_mounts = process_manager.fuse_pid().is_none()
                     || (!cli.skip_rclone && process_manager.rclone_pid().is_none());
@@ -575,41 +579,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let key_opt = master_key_shared.read().await.clone();
                     if let Some(key) = key_opt {
                         info!("Master key present. Spawning background mounts...");
-                        let remote = {
+                        let (remote, vault_name) = {
                             let cfg = daemon_config_shared.read().await;
-                            cfg.rclone_remote.clone()
+                            (cfg.rclone_remote.clone(), cfg.vault_name.clone())
                         };
                         process_manager.set_remote(remote);
+                        process_manager.set_vault_name(vault_name);
                         *raw_mount_shared.write().await = process_manager.raw_mount_path().to_path_buf();
 
-                        if !cli.skip_rclone && process_manager.rclone_pid().is_none() {
-                            match process_manager.spawn_rclone().await {
-                                Ok(pid) => {
-                                    *rclone_pid_shared.write().await = Some(pid);
-                                    let _ = process_manager.wait_rclone_rc_ready(Duration::from_secs(optimizations.network.rc_ready_timeout_secs)).await;
+                        if !cli.skip_rclone {
+                            if process_manager.webdav_pid().is_none() {
+                                if let Err(e) = process_manager.spawn_webdav().await {
+                                    warn!("Failed to spawn rclone WebDAV: {}", e);
+                                }
+                            }
+                            if process_manager.rclone_pid().is_none() {
+                                match process_manager.spawn_rclone().await {
+                                    Ok(pid) => {
+                                        *rclone_pid_shared.write().await = Some(pid);
+                                        let _ = process_manager.wait_rclone_rc_ready(Duration::from_secs(optimizations.network.rc_ready_timeout_secs)).await;
 
-                                    // Wait for raw mount before freeze prevention rules and spawn_fuse (1.4)
-                                    let raw_mount = process_manager.raw_mount_path().to_path_buf();
-                                    let mount_timeout = Duration::from_secs(optimizations.network.rc_ready_timeout_secs);
-                                    let retry_interval = Duration::from_millis(optimizations.network.rc_ready_retry_ms);
-                                    if let Err(e) = process::wait_for_mount(&raw_mount, "fuse", mount_timeout, retry_interval).await {
-                                        error!("Raw mount readiness check failed: {}", e);
-                                        let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
-                                    } else {
-                                        if optimizations.features.enable_freeze_prevention {
-                                            process::apply_folder_freeze_prevention_rules(&raw_mount);
-                                        }
-                                        process_manager.warm_vfs_cache();
-
-                                        // Spawn WebDAV after raw mount is ready so startup API queries don't clash
-                                        if process_manager.webdav_pid().is_none() {
-                                            let _ = process_manager.spawn_webdav().await;
+                                        // Wait for raw mount before freeze prevention rules and spawn_fuse (1.4)
+                                        let raw_mount = process_manager.raw_mount_path().to_path_buf();
+                                        let mount_timeout = Duration::from_secs(optimizations.network.rc_ready_timeout_secs);
+                                        let retry_interval = Duration::from_millis(optimizations.network.rc_ready_retry_ms);
+                                        if let Err(e) = process::wait_for_mount(&raw_mount, "fuse", mount_timeout, retry_interval).await {
+                                            error!("Raw mount readiness check failed: {}", e);
+                                            let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
+                                        } else {
+                                            if optimizations.features.enable_freeze_prevention {
+                                                process::apply_folder_freeze_prevention_rules(&raw_mount);
+                                            }
+                                            process_manager.warm_vfs_cache();
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    error!("Failed to spawn rclone: {}", e);
-                                    let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
+                                    Err(e) => {
+                                        error!("Failed to spawn rclone: {}", e);
+                                        let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
+                                    }
                                 }
                             }
                         }

@@ -75,6 +75,7 @@ pub enum DaemonIpcResponse {
     SyncFolders(Vec<SyncFolderInfo>),
     SyncHiddenFiles(bool),
     DriveApiCredentials(DriveApiCredentialsPayload),
+    RemoteVaults(Vec<String>),
     Ok(String),
     Err(String),
 }
@@ -413,6 +414,123 @@ pub mod commands {
         let cmd = serde_json::to_string(&serde_json::json!({
             "cmd": "RecoverVault",
             "data": {
+                "recovery_key": recovery_key,
+                "new_password": new_password
+            }
+        }))
+        .map_err(|e| e.to_string())?;
+
+        match state.query_daemon(&cmd).await {
+            Ok(raw_json) => {
+                let parsed: DaemonIpcResponse = serde_json::from_str(&raw_json)
+                    .map_err(|e| format!("JSON parse error: {e}"))?;
+                match parsed {
+                    DaemonIpcResponse::Ok(msg) => {
+                        state.update_tray_state(&SyncState::Idle);
+                        Ok(msg)
+                    }
+                    DaemonIpcResponse::Err(e) => Err(e),
+                    _ => Err("Unexpected response type from daemon".to_string()),
+                }
+            }
+            Err(e) => Err(format!("Failed to contact daemon: {e}")),
+        }
+    }
+
+    /// Lists all remote vaults in Google Drive under Aksync/
+    #[tauri::command]
+    pub async fn list_remote_vaults(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<Vec<String>, String> {
+        match state.query_daemon("{\"cmd\":\"ListRemoteVaults\"}").await {
+            Ok(raw_json) => {
+                let parsed: DaemonIpcResponse = serde_json::from_str(&raw_json)
+                    .map_err(|e| format!("JSON parse error: {e}"))?;
+                match parsed {
+                    DaemonIpcResponse::RemoteVaults(vaults) => Ok(vaults),
+                    DaemonIpcResponse::Err(e) => Err(e),
+                    _ => Err("Unexpected response type from daemon".to_string()),
+                }
+            }
+            Err(e) => Err(format!("Failed to contact daemon: {e}")),
+        }
+    }
+
+    /// Initializes a new vault with custom name and password
+    #[tauri::command]
+    pub async fn initialize_vault_named(
+        vault_name: String,
+        password: String,
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<String, String> {
+        let cmd = serde_json::to_string(&serde_json::json!({
+            "cmd": "InitializeVaultWithConfig",
+            "data": {
+                "vault_name": vault_name,
+                "password": password
+            }
+        }))
+        .map_err(|e| e.to_string())?;
+
+        match state.query_daemon(&cmd).await {
+            Ok(raw_json) => {
+                let parsed: DaemonIpcResponse = serde_json::from_str(&raw_json)
+                    .map_err(|e| format!("JSON parse error: {e}"))?;
+                match parsed {
+                    DaemonIpcResponse::Ok(msg) => {
+                        state.update_tray_state(&SyncState::Locked);
+                        Ok(msg)
+                    }
+                    DaemonIpcResponse::Err(e) => Err(e),
+                    _ => Err("Unexpected response type from daemon".to_string()),
+                }
+            }
+            Err(e) => Err(format!("Failed to contact daemon: {e}")),
+        }
+    }
+
+    /// Verifies 52-char recovery key against cloud vault metadata
+    #[tauri::command]
+    pub async fn verify_cloud_vault_recovery_key(
+        vault_name: String,
+        recovery_key: String,
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<String, String> {
+        let cmd = serde_json::to_string(&serde_json::json!({
+            "cmd": "VerifyCloudVaultRecoveryKey",
+            "data": {
+                "vault_name": vault_name,
+                "recovery_key": recovery_key
+            }
+        }))
+        .map_err(|e| e.to_string())?;
+
+        match state.query_daemon(&cmd).await {
+            Ok(raw_json) => {
+                let parsed: DaemonIpcResponse = serde_json::from_str(&raw_json)
+                    .map_err(|e| format!("JSON parse error: {e}"))?;
+                match parsed {
+                    DaemonIpcResponse::Ok(msg) => Ok(msg),
+                    DaemonIpcResponse::Err(e) => Err(e),
+                    _ => Err("Unexpected response type from daemon".to_string()),
+                }
+            }
+            Err(e) => Err(format!("Failed to contact daemon: {e}")),
+        }
+    }
+
+    /// Recovers cloud vault with recovery key and new local password
+    #[tauri::command]
+    pub async fn recover_cloud_vault(
+        vault_name: String,
+        recovery_key: String,
+        new_password: String,
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<String, String> {
+        let cmd = serde_json::to_string(&serde_json::json!({
+            "cmd": "RecoverCloudVault",
+            "data": {
+                "vault_name": vault_name,
                 "recovery_key": recovery_key,
                 "new_password": new_password
             }
@@ -1407,7 +1525,11 @@ pub fn run() {
             commands::set_drive_api_credentials,
             commands::lock_vault,
             commands::change_passphrase,
-            commands::recover_vault
+            commands::recover_vault,
+            commands::list_remote_vaults,
+            commands::initialize_vault_named,
+            commands::verify_cloud_vault_recovery_key,
+            commands::recover_cloud_vault
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -120,6 +120,7 @@ pub async fn trigger_drive_auth() -> Result<String, String> {
     }
 }
 
+#[allow(dead_code)]
 pub async fn initialize_vault(password: String) -> Result<String, String> {
     let args = serde_wasm_bindgen::to_value(&InitVaultArgs { password }).unwrap_or(JsValue::NULL);
     match tauri_invoke("initialize_vault", args).await {
@@ -332,6 +333,77 @@ pub async fn set_drive_api_credentials(client_id: String, client_secret: String)
     })
     .unwrap_or(JsValue::NULL);
     match tauri_invoke("set_drive_api_credentials", args).await {
+        Ok(js_val) => serde_wasm_bindgen::from_value(js_val)
+            .map_err(|e| format!("Failed to parse response: {e}")),
+        Err(e) => Err(js_error_to_string(e)),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitVaultNamedArgs {
+    vault_name: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyCloudVaultRecoveryKeyArgs {
+    vault_name: String,
+    recovery_key: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoverCloudVaultArgs {
+    vault_name: String,
+    recovery_key: String,
+    new_password: String,
+}
+
+pub async fn list_remote_vaults() -> Result<Vec<String>, String> {
+    let empty_args = JsValue::from_str("{}");
+    match tauri_invoke("list_remote_vaults", empty_args).await {
+        Ok(js_val) => serde_wasm_bindgen::from_value(js_val)
+            .map_err(|e| format!("Failed to parse response: {e}")),
+        Err(e) => Err(js_error_to_string(e)),
+    }
+}
+
+pub async fn initialize_vault_named(vault_name: String, password: String) -> Result<String, String> {
+    let args = serde_wasm_bindgen::to_value(&InitVaultNamedArgs {
+        vault_name,
+        password,
+    })
+    .unwrap_or(JsValue::NULL);
+    match tauri_invoke("initialize_vault_named", args).await {
+        Ok(js_val) => serde_wasm_bindgen::from_value(js_val)
+            .map_err(|e| format!("Failed to parse response: {e}")),
+        Err(e) => Err(js_error_to_string(e)),
+    }
+}
+
+pub async fn verify_cloud_vault_recovery_key(vault_name: String, recovery_key: String) -> Result<String, String> {
+    let args = serde_wasm_bindgen::to_value(&VerifyCloudVaultRecoveryKeyArgs {
+        vault_name,
+        recovery_key,
+    })
+    .unwrap_or(JsValue::NULL);
+    match tauri_invoke("verify_cloud_vault_recovery_key", args).await {
+        Ok(js_val) => serde_wasm_bindgen::from_value(js_val)
+            .map_err(|e| format!("Failed to parse response: {e}")),
+        Err(e) => Err(js_error_to_string(e)),
+    }
+}
+
+pub async fn recover_cloud_vault(vault_name: String, recovery_key: String, new_password: String) -> Result<String, String> {
+    let args = serde_wasm_bindgen::to_value(&RecoverCloudVaultArgs {
+        vault_name,
+        recovery_key,
+        new_password,
+    })
+    .unwrap_or(JsValue::NULL);
+    match tauri_invoke("recover_cloud_vault", args).await {
         Ok(js_val) => serde_wasm_bindgen::from_value(js_val)
             .map_err(|e| format!("Failed to parse response: {e}")),
         Err(e) => Err(js_error_to_string(e)),

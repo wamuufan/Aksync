@@ -32,14 +32,25 @@ log_error() {
 }
 
 # ------------------------------------------------------------------------------
-# 0. Ensure Native Binaries Exist (Auto-build if missing)
+# 0. Ensure Native Binaries Exist (Auto-build if missing or outdated)
 # ------------------------------------------------------------------------------
-if [ ! -f "${ROOT_DIR}/target/release/mycloud-daemon" ] || [ ! -f "${ROOT_DIR}/target/release/mycloud-gui" ]; then
-    log_warn "Release binaries not found. Running ./scripts/build.sh first..."
+if [ ! -f "${ROOT_DIR}/target/release/mycloud-daemon" ] || \
+   [ ! -f "${ROOT_DIR}/target/release/mycloud-fuse" ] || \
+   [ ! -f "${ROOT_DIR}/target/release/mycloud-gui" ] || \
+   [ -n "$(find "${ROOT_DIR}/crates" -name '*.rs' -newer "${ROOT_DIR}/target/release/mycloud-daemon" 2>/dev/null)" ]; then
+    log_warn "Release binaries missing or outdated. Running ./scripts/build.sh..."
     "${ROOT_DIR}/scripts/build.sh"
 fi
 
-# Clean up any leftover mounts from prior sessions before starting
+# Clean up any leftover processes and mounts from prior sessions before starting
+pkill -f mycloud-daemon 2>/dev/null || true
+pkill -f mycloud-fuse 2>/dev/null || true
+pkill -f "rclone serve webdav" 2>/dev/null || true
+pkill -f "rclone mount" 2>/dev/null || true
+pkill -9 -f "rclone config" 2>/dev/null || true
+sleep 0.2
+
+fusermount3 -u -z "${HOME}/.local/share/mycloud/gdrive" 2>/dev/null || true
 fusermount3 -u -z "${HOME}/.local/share/mycloud/vault" 2>/dev/null || true
 fusermount3 -u -z "${HOME}/.cache/mycloud/raw_vault" 2>/dev/null || true
 fusermount3 -u -z "${HOME}/MyCloud" 2>/dev/null || true
@@ -61,7 +72,12 @@ cleanup() {
     log_warn "Stopping background mycloud-daemon (PID: ${DAEMON_PID})..."
     kill "${DAEMON_PID}" 2>/dev/null || true
     wait "${DAEMON_PID}" 2>/dev/null || true
+    pkill -f "rclone serve webdav" 2>/dev/null || true
+    pkill -f mycloud-fuse 2>/dev/null || true
+    pkill -f "rclone mount" 2>/dev/null || true
+    pkill -9 -f "rclone config" 2>/dev/null || true
     # Lazily unmount so file managers (e.g. Dolphin) never cause 'Device or resource busy'
+    fusermount3 -u -z "${HOME}/.local/share/mycloud/gdrive" 2>/dev/null || true
     fusermount3 -u -z "${HOME}/.local/share/mycloud/vault" 2>/dev/null || true
     fusermount3 -u -z "${HOME}/.cache/mycloud/raw_vault" 2>/dev/null || true
     fusermount3 -u -z "${HOME}/MyCloud" 2>/dev/null || true
@@ -77,7 +93,13 @@ path = '${HOME}/.local/share/user-places.xbel'
 try:
     with open(path, 'r', encoding='utf-8') as f:
         c = f.read()
-    c = re.sub(r' *<bookmark href=\"webdav://127\.0\.0\.1:876[56]/\">.*?</bookmark>\n?', '', c, flags=re.DOTALL)
+    patterns = [
+        r' *<bookmark href=\"webdav://[^\"]*876[56][^\"]*\".*?</bookmark>\n?',
+        r' *<bookmark[^>]*>\s*<title>Google Drive</title>.*?</bookmark>\n?',
+        r' *<bookmark[^>]*>\s*<title>MyCloud</title>.*?</bookmark>\n?'
+    ]
+    for pat in patterns:
+        c = re.sub(pat, '', c, flags=re.DOTALL)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(c)
 except Exception:

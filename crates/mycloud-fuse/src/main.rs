@@ -24,6 +24,7 @@ use mycloud_crypto::{
     HEADER_SIZE_V3, MAC_SIZE, MAGIC_V3, MAX_RAW_FILENAME_LEN,
 };
 
+const VAULT_META_FILENAME: &str = ".aksync_vault.json";
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_SUPER_MAGIC: u64 = 0x65735546;
 
@@ -64,7 +65,7 @@ pub struct Args {
     pub raw_fstype_check: bool,
 
     /// Timeout in seconds for any single FUSE filesystem operation before returning EIO
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 60)]
     pub op_timeout_secs: u64,
 
     /// Migrate all v2 encrypted files to Format v3 under raw_path and exit
@@ -614,15 +615,13 @@ impl FsInner {
         let deadline = Instant::now() + Duration::from_secs(self.op_timeout_secs);
 
         let cell_clone = cell.clone();
-        let health_clone = self.health.clone();
         let timeout_secs = self.op_timeout_secs;
         self.timeout_scheduler.schedule(deadline, move || {
             if let Some(r) = cell_clone.lock().take() {
                 warn!(
-                    "FUSE operation timed out after {}s, returning EIO and marking raw mount unhealthy",
+                    "FUSE operation timed out after {}s, returning EIO",
                     timeout_secs
                 );
-                health_clone.mark_unhealthy();
                 r.error(libc::EIO);
             }
         });
@@ -660,18 +659,39 @@ impl FsInner {
         }
 
         let diriv_path = raw_dir_path.join(DIRIV_FILENAME);
-        if diriv_path.exists() {
-            let mut f = File::open(&diriv_path).map_err(|e| io_err_to_errno(&e))?;
-            let mut hdr = [0u8; HEADER_SIZE_V3];
-            f.read_exact(&mut hdr).map_err(|_| libc::EIO)?;
+        let can_create = create_if_missing || (rel_dir_path.as_os_str().is_empty() && raw_dir_path.exists());
 
-            let dir_id = self.engine.verify_v3_header(&hdr).map_err(|_| libc::EIO)?;
-            let hex_id = hex::encode(dir_id);
-            self.dir_ids
-                .write()
-                .insert(rel_dir_path.to_path_buf(), hex_id.clone());
-            Ok(hex_id)
-        } else if create_if_missing || (rel_dir_path.as_os_str().is_empty() && raw_dir_path.exists()) {
+        if diriv_path.exists() {
+            let read_res = (|| -> Result<String, i32> {
+                let mut f = File::open(&diriv_path).map_err(|e| io_err_to_errno(&e))?;
+                let mut hdr = [0u8; HEADER_SIZE_V3];
+                f.read_exact(&mut hdr).map_err(|_| libc::EIO)?;
+                let dir_id = self.engine.verify_v3_header(&hdr).map_err(|_| libc::EIO)?;
+                Ok(hex::encode(dir_id))
+            })();
+
+            match read_res {
+                Ok(hex_id) => {
+                    self.dir_ids
+                        .write()
+                        .insert(rel_dir_path.to_path_buf(), hex_id.clone());
+                    return Ok(hex_id);
+                }
+                Err(e) => {
+                    if can_create {
+                        warn!(
+                            "Existing {} in {:?} is corrupted or invalid (error: {}), recreating...",
+                            DIRIV_FILENAME, raw_dir_path, e
+                        );
+                        let _ = fs::remove_file(&diriv_path);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        if can_create {
             if !raw_dir_path.exists() {
                 return Err(libc::ENOENT);
             }
@@ -700,7 +720,10 @@ impl FsInner {
 
             if write_res.is_err() {
                 let _ = fs::remove_file(&tmp_path);
-                return write_res.map(|_| String::new());
+                if let Err(direct_err) = fs::write(&diriv_path, hdr) {
+                    warn!("Fallback direct write of {} failed: {}", DIRIV_FILENAME, direct_err);
+                    return Err(io_err_to_errno(&direct_err));
+                }
             }
 
             let hex_id = hex::encode(dir_id);
@@ -1694,7 +1717,10 @@ impl FsInner {
                 Err(_) => continue,
             };
 
-            if raw_file_name == DIRIV_FILENAME || is_longname_sidecar(&raw_file_name) {
+            if raw_file_name == DIRIV_FILENAME
+                || raw_file_name == VAULT_META_FILENAME
+                || is_longname_sidecar(&raw_file_name)
+            {
                 continue;
             }
 
@@ -2085,12 +2111,29 @@ impl FsInner {
         };
 
         self.inode_locks.with_locks(&[parent], || {
-            if let Err(err) = fs::remove_file(&raw_child) {
-                let errno = io_err_to_errno(&err);
-                if let Some(r) = guard.take() {
-                    r.error(errno);
+            let mut remove_res = fs::remove_file(&raw_child);
+            if let Err(ref err) = remove_res {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    for _ in 0..3 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        remove_res = fs::remove_file(&raw_child);
+                        if remove_res.is_ok()
+                            || remove_res.as_ref().err().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound)
+                        {
+                            break;
+                        }
+                    }
                 }
-                return;
+            }
+
+            if let Err(err) = remove_res {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    let errno = io_err_to_errno(&err);
+                    if let Some(r) = guard.take() {
+                        r.error(errno);
+                    }
+                    return;
+                }
             }
 
             self.remove_longname_sidecar_if_any(&raw_child);
@@ -2135,6 +2178,7 @@ impl FsInner {
                 }
             };
 
+            let dir_id = self.get_or_create_dir_id(&raw_child, &child_path, false).ok();
             let mut meta_files = Vec::new();
             let mut has_user_files = false;
 
@@ -2155,12 +2199,35 @@ impl FsInner {
                 if file_name_str == DIRIV_FILENAME
                     || file_name_str == ".nomedia"
                     || file_name_str == ".directory"
+                    || file_name_str.starts_with(".aksync_diriv.tmp.")
                     || is_longname_sidecar(&file_name_str)
                 {
                     meta_files.push(entry.path());
                 } else {
-                    has_user_files = true;
-                    break;
+                    let is_valid_user_file = if is_longname_file(&file_name_str) {
+                        let sidecar_path = raw_child.join(longname_sidecar_for(&file_name_str));
+                        match fs::read_to_string(&sidecar_path) {
+                            Ok(sidecar_content) => {
+                                let enc_name = sidecar_content.trim();
+                                if hash_long_cipher_name(enc_name) == file_name_str {
+                                    decrypt_filename(&self.engine, enc_name, dir_id.as_deref()).is_ok()
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(_) => false,
+                        }
+                    } else {
+                        decrypt_filename(&self.engine, &file_name_str, dir_id.as_deref()).is_ok()
+                    };
+
+                    if is_valid_user_file {
+                        has_user_files = true;
+                        break;
+                    } else {
+                        // Orphan/corrupted leftover file unreadable by user readdir
+                        meta_files.push(entry.path());
+                    }
                 }
             }
 
@@ -2172,15 +2239,37 @@ impl FsInner {
             }
 
             for meta in meta_files {
-                let _ = fs::remove_file(meta);
+                if meta.is_dir() {
+                    let _ = fs::remove_dir_all(&meta);
+                } else {
+                    let _ = fs::remove_file(&meta);
+                }
             }
 
-            if let Err(err) = fs::remove_dir(&raw_child) {
-                let errno = io_err_to_errno(&err);
-                if let Some(r) = guard.take() {
-                    r.error(errno);
+            let mut remove_res = fs::remove_dir(&raw_child);
+            if remove_res.is_err() {
+                for i in 0..5 {
+                    std::thread::sleep(Duration::from_millis(150));
+                    remove_res = fs::remove_dir(&raw_child);
+                    if remove_res.is_ok()
+                        || remove_res.as_ref().err().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound)
+                    {
+                        break;
+                    }
+                    if i == 4 {
+                        remove_res = fs::remove_dir_all(&raw_child);
+                    }
                 }
-                return;
+            }
+
+            if let Err(err) = remove_res {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    let errno = io_err_to_errno(&err);
+                    if let Some(r) = guard.take() {
+                        r.error(errno);
+                    }
+                    return;
+                }
             }
 
             self.remove_longname_sidecar_if_any(&raw_child);

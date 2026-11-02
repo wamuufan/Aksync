@@ -81,6 +81,11 @@
             -webkit-user-select: none;
         }
 
+        input, textarea, code, .selectable-text {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+        }
+
         body, .app-root {
             height: 100vh;
             width: 100vw;
@@ -924,6 +929,75 @@
             height: 0.85rem;
             width: 80px;
             vertical-align: middle;
+        }
+
+        /* Soft Accordion & View Transition Animations */
+        .soft-collapse-wrapper {
+            display: grid;
+            grid-template-rows: 0fr;
+            opacity: 0;
+            transition: grid-template-rows 0.32s cubic-bezier(0.22, 1, 0.36, 1),
+                        opacity 0.26s cubic-bezier(0.22, 1, 0.36, 1),
+                        margin-top 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+            overflow: hidden;
+            margin-top: 0;
+        }
+
+        .soft-collapse-wrapper.expanded {
+            grid-template-rows: 1fr;
+            opacity: 1;
+            margin-top: 0.75rem;
+        }
+
+        .soft-collapse-inner {
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        @keyframes softFadeSlideIn {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .wizard-card, .content-section, .unlock-card {
+            animation: softFadeSlideIn 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+        }
+
+        .accordion-header-btn {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.65rem 0.85rem;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-box, 6px);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: background 0.18s ease, border-color 0.18s ease;
+        }
+
+        .accordion-header-btn:hover {
+            background: color-mix(in srgb, var(--accent-color) 12%, var(--card-bg));
+            border-color: var(--accent-color);
+        }
+
+        .accordion-chevron {
+            display: inline-block;
+            transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+            font-size: 0.8rem;
+            margin-right: 0.45rem;
+            color: var(--accent-color);
+        }
+
+        .accordion-chevron.open {
+            transform: rotate(90deg);
         }
     </style>
 </head>
