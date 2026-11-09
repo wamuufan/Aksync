@@ -62,13 +62,14 @@ pub fn encrypt_filename(
         return Ok(plain_name.to_string());
     }
 
-    // Derive deterministic 192-bit nonce using Blake2bMac512 keyed with engine.k_name()
-    let mut mac = <Blake2bMac512 as Mac>::new_from_slice(engine.k_name())
+    // Derive deterministic 192-bit nonce using Blake2bMac512 keyed with engine.k_name_mac()
+    let mut mac = <Blake2bMac512 as Mac>::new_from_slice(engine.k_name_mac())
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
-    mac.update(b"mycloud-filename-nonce-v3");
-    if let Some(ctx) = dir_context {
-        mac.update(ctx.as_bytes());
-    }
+    mac.update(b"mycloud-filename-nonce-v3:");
+    let ctx_bytes = dir_context.unwrap_or("").as_bytes();
+    mac.update(&(ctx_bytes.len() as u32).to_le_bytes());
+    mac.update(ctx_bytes);
+    mac.update(&(plain_name.len() as u32).to_le_bytes());
     mac.update(plain_name.as_bytes());
     let hash = mac.finalize().into_bytes();
 

@@ -21,12 +21,13 @@ use mycloud_crypto::{
     decrypt_filename, encrypt_filename, hash_long_cipher_name, is_longname_file,
     is_longname_sidecar, longname_sidecar_for, CryptoEngine, CHUNK_CIPHER_SIZE_V2,
     CHUNK_DISK_SIZE_V3, CHUNK_OVERHEAD_V3, CHUNK_PLAIN_SIZE, DIRIV_FILENAME, HEADER_SIZE_V2,
-    HEADER_SIZE_V3, MAC_SIZE, MAGIC_V3, MAX_RAW_FILENAME_LEN,
+    HEADER_SIZE_V3, LONGNAME_SUFFIX, MAC_SIZE, MAGIC_V3, MAX_RAW_FILENAME_LEN,
 };
 
 const VAULT_META_FILENAME: &str = ".aksync_vault.json";
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_SUPER_MAGIC: u64 = 0x65735546;
+const MAX_SPARSE_EXPANSION_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB sparse gap guard
 
 /// CLI arguments for mycloud-fuse
 #[derive(Parser, Debug)]
@@ -574,16 +575,18 @@ impl WorkerPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.sender.try_send(Box::new(job)).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => {
-                warn!("FUSE worker pool queue is full! Rejecting operation with EIO");
-                DispatchError::QueueFull
-            }
-            crossbeam_channel::TrySendError::Disconnected(_) => {
-                error!("FUSE worker pool is disconnected!");
-                DispatchError::Disconnected
-            }
-        })
+        self.sender
+            .send_timeout(Box::new(job), Duration::from_secs(5))
+            .map_err(|e| match e {
+                crossbeam_channel::SendTimeoutError::Timeout(_) => {
+                    warn!("FUSE worker pool queue is full (timed out after 5s)! Rejecting operation with EIO");
+                    DispatchError::QueueFull
+                }
+                crossbeam_channel::SendTimeoutError::Disconnected(_) => {
+                    error!("FUSE worker pool is disconnected!");
+                    DispatchError::Disconnected
+                }
+            })
     }
 }
 
@@ -594,6 +597,7 @@ pub struct FsInner {
     pub health: RawMountHealth,
     pub handles: HandleTable,
     pub inode_locks: InodeLocks,
+    pub diriv_create_lock: parking_lot::Mutex<()>,
     pub worker_pool: WorkerPool,
     pub timeout_scheduler: TimeoutScheduler,
     pub op_timeout_secs: u64,
@@ -658,81 +662,121 @@ impl FsInner {
             let _ = fs::create_dir_all(raw_dir_path);
         }
 
-        let diriv_path = raw_dir_path.join(DIRIV_FILENAME);
-        let can_create = create_if_missing || (rel_dir_path.as_os_str().is_empty() && raw_dir_path.exists());
-
-        if diriv_path.exists() {
-            let read_res = (|| -> Result<String, i32> {
-                let mut f = File::open(&diriv_path).map_err(|e| io_err_to_errno(&e))?;
-                let mut hdr = [0u8; HEADER_SIZE_V3];
-                f.read_exact(&mut hdr).map_err(|_| libc::EIO)?;
-                let dir_id = self.engine.verify_v3_header(&hdr).map_err(|_| libc::EIO)?;
-                Ok(hex::encode(dir_id))
-            })();
-
-            match read_res {
-                Ok(hex_id) => {
-                    self.dir_ids
-                        .write()
-                        .insert(rel_dir_path.to_path_buf(), hex_id.clone());
-                    return Ok(hex_id);
-                }
-                Err(e) => {
-                    if can_create {
-                        warn!(
-                            "Existing {} in {:?} is corrupted or invalid (error: {}), recreating...",
-                            DIRIV_FILENAME, raw_dir_path, e
-                        );
-                        let _ = fs::remove_file(&diriv_path);
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+        // Double-checked locking to avoid concurrent creation race conditions
+        let _guard = self.diriv_create_lock.lock();
+        if let Some(id) = self.dir_ids.read().get(rel_dir_path) {
+            return Ok(id.clone());
         }
 
-        if can_create {
-            if !raw_dir_path.exists() {
-                return Err(libc::ENOENT);
-            }
-            let (hdr, dir_id) = self.engine.create_v3_header();
-            let rand_val = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let tmp_path = raw_dir_path.join(format!(
-                ".aksync_diriv.tmp.{}.{}",
-                std::process::id(),
-                rand_val
-            ));
-            let write_res = (|| -> Result<(), i32> {
-                let mut tmp = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp_path)
-                    .map_err(|e| io_err_to_errno(&e))?;
-                tmp.write_all(&hdr).map_err(|e| io_err_to_errno(&e))?;
-                tmp.sync_all().map_err(|e| io_err_to_errno(&e))?;
-                fs::rename(&tmp_path, &diriv_path).map_err(|e| io_err_to_errno(&e))?;
-                Ok(())
-            })();
+        let diriv_path = raw_dir_path.join(DIRIV_FILENAME);
 
-            if write_res.is_err() {
-                let _ = fs::remove_file(&tmp_path);
-                if let Err(direct_err) = fs::write(&diriv_path, hdr) {
-                    warn!("Fallback direct write of {} failed: {}", DIRIV_FILENAME, direct_err);
-                    return Err(io_err_to_errno(&direct_err));
+        match File::open(&diriv_path) {
+            Ok(mut f) => {
+                let mut hdr = [0u8; HEADER_SIZE_V3];
+                if f.read_exact(&mut hdr).is_err() {
+                    error!(
+                        "Failed to read {} in {:?}: corrupted or short header",
+                        DIRIV_FILENAME, raw_dir_path
+                    );
+                    return Err(libc::EIO);
                 }
+                let dir_id = self.engine.verify_v3_header(&hdr).map_err(|e| {
+                    error!(
+                        "Failed to verify {} header in {:?}: {:?}",
+                        DIRIV_FILENAME, raw_dir_path, e
+                    );
+                    libc::EIO
+                })?;
+                let hex_id = hex::encode(dir_id);
+                self.dir_ids
+                    .write()
+                    .insert(rel_dir_path.to_path_buf(), hex_id.clone());
+                Ok(hex_id)
             }
+            Err(open_err) => {
+                if open_err.kind() != std::io::ErrorKind::NotFound {
+                    error!(
+                        "I/O error opening {} in {:?}: {}",
+                        DIRIV_FILENAME, raw_dir_path, open_err
+                    );
+                    return Err(io_err_to_errno(&open_err));
+                }
 
-            let hex_id = hex::encode(dir_id);
-            self.dir_ids
-                .write()
-                .insert(rel_dir_path.to_path_buf(), hex_id.clone());
-            Ok(hex_id)
-        } else {
-            Err(libc::ENOENT)
+                let can_create = create_if_missing
+                    || (rel_dir_path.as_os_str().is_empty() && raw_dir_path.exists());
+                if !can_create {
+                    return Err(libc::ENOENT);
+                }
+
+                if !raw_dir_path.exists() {
+                    return Err(libc::ENOENT);
+                }
+
+                let (hdr, dir_id) = self.engine.create_v3_header();
+                let rand_val = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp_path = raw_dir_path.join(format!(
+                    ".aksync_diriv.tmp.{}.{}",
+                    std::process::id(),
+                    rand_val
+                ));
+                let write_res = (|| -> Result<(), i32> {
+                    let mut tmp = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp_path)
+                        .map_err(|e| io_err_to_errno(&e))?;
+                    tmp.write_all(&hdr).map_err(|e| io_err_to_errno(&e))?;
+                    tmp.sync_all().map_err(|e| io_err_to_errno(&e))?;
+                    fs::rename(&tmp_path, &diriv_path).map_err(|e| io_err_to_errno(&e))?;
+                    Ok(())
+                })();
+
+                if write_res.is_err() {
+                    let _ = fs::remove_file(&tmp_path);
+                    match OpenOptions::new().write(true).create_new(true).open(&diriv_path) {
+                        Ok(mut f) => {
+                            if let Err(e) = f.write_all(&hdr).and_then(|_| f.sync_all()) {
+                                let _ = fs::remove_file(&diriv_path);
+                                return Err(io_err_to_errno(&e));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let existing_bytes = fs::read(&diriv_path).map_err(|re| io_err_to_errno(&re))?;
+                            if existing_bytes.len() < HEADER_SIZE_V3 {
+                                return Err(libc::EIO);
+                            }
+                            let mut hdr_bytes = [0u8; HEADER_SIZE_V3];
+                            hdr_bytes.copy_from_slice(&existing_bytes[..HEADER_SIZE_V3]);
+                            let existing_id = self
+                                .engine
+                                .verify_v3_header(&hdr_bytes)
+                                .map_err(|_| libc::EIO)?;
+                            let hex_id = hex::encode(existing_id);
+                            self.dir_ids
+                                .write()
+                                .insert(rel_dir_path.to_path_buf(), hex_id.clone());
+                            return Ok(hex_id);
+                        }
+                        Err(direct_err) => {
+                            warn!(
+                                "Fallback create_new write of {} failed: {}",
+                                DIRIV_FILENAME, direct_err
+                            );
+                            return Err(io_err_to_errno(&direct_err));
+                        }
+                    }
+                }
+
+                let hex_id = hex::encode(dir_id);
+                self.dir_ids
+                    .write()
+                    .insert(rel_dir_path.to_path_buf(), hex_id.clone());
+                Ok(hex_id)
+            }
         }
     }
 
@@ -753,7 +797,22 @@ impl FsInner {
             let short_name = hash_long_cipher_name(&enc_name);
             let sidecar_path = parent_raw_dir.join(longname_sidecar_for(&short_name));
             if !sidecar_path.exists() {
-                fs::write(&sidecar_path, enc_name.as_bytes()).map_err(|e| io_err_to_errno(&e))?;
+                let tmp_sidecar = parent_raw_dir.join(format!(
+                    ".{}.tmp.{}",
+                    longname_sidecar_for(&short_name),
+                    std::process::id()
+                ));
+                if fs::write(&tmp_sidecar, enc_name.as_bytes()).is_ok() {
+                    if fs::rename(&tmp_sidecar, &sidecar_path).is_err() {
+                        let _ = fs::remove_file(&tmp_sidecar);
+                        if !sidecar_path.exists() {
+                            fs::write(&sidecar_path, enc_name.as_bytes())
+                                .map_err(|e| io_err_to_errno(&e))?;
+                        }
+                    }
+                } else {
+                    fs::write(&sidecar_path, enc_name.as_bytes()).map_err(|e| io_err_to_errno(&e))?;
+                }
             }
         }
         Ok(())
@@ -856,7 +915,7 @@ impl FsInner {
     }
 
     /// Builds a FileAttr structure for a given inode and physical file metadata
-    pub fn build_file_attr(&self, ino: u64, _raw_path: &Path, meta: &fs::Metadata) -> FileAttr {
+    pub fn build_file_attr(&self, ino: u64, raw_path: &Path, meta: &fs::Metadata) -> FileAttr {
         let is_dir = meta.is_dir();
         let is_symlink = meta.file_type().is_symlink();
         let kind = if is_dir {
@@ -873,8 +932,26 @@ impl FsInner {
         } else if is_symlink {
             raw_size
         } else if raw_size >= (HEADER_SIZE_V3 as u64) {
-            CryptoEngine::calculate_plain_size_v3_checked(raw_size)
-                .unwrap_or_else(|_| CryptoEngine::calculate_plain_size(raw_size))
+            let mut magic = [0u8; 4];
+            let read_magic = (|| -> Result<[u8; 4], std::io::Error> {
+                let mut f = File::open(raw_path)?;
+                f.read_exact(&mut magic)?;
+                Ok(magic)
+            })();
+
+            match read_magic {
+                Ok(magic_bytes) => {
+                    if &magic_bytes == MAGIC_V3 {
+                        CryptoEngine::calculate_plain_size_v3_checked(raw_size).unwrap_or(0)
+                    } else {
+                        CryptoEngine::calculate_plain_size(raw_size)
+                    }
+                }
+                Err(_) => {
+                    CryptoEngine::calculate_plain_size_v3_checked(raw_size)
+                        .unwrap_or_else(|_| CryptoEngine::calculate_plain_size(raw_size))
+                }
+            }
         } else {
             0
         };
@@ -1137,6 +1214,14 @@ impl FsInner {
         let write_start_chunk = plain_start / (CHUNK_PLAIN_SIZE as u64);
         let write_end_chunk = (plain_end - 1) / (CHUNK_PLAIN_SIZE as u64);
 
+        // O6: Reject excessively large sparse gap to prevent disk/quota exhaustion
+        if write_start_chunk > old_total_chunks {
+            let gap_bytes = (write_start_chunk - old_total_chunks) * (CHUNK_PLAIN_SIZE as u64);
+            if gap_bytes > MAX_SPARSE_EXPANSION_BYTES {
+                return Err(libc::EFBIG);
+            }
+        }
+
         // 5. Precondition verification (Atomic error protection - C2):
         // Decrypt and verify existing chunks that will be read or updated before writing any byte.
         let mut pre_decrypted: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -1189,26 +1274,7 @@ impl FsInner {
             }
         }
 
-        // 6. Critical Step A: Update old last chunk if needed (pad to 64K, is_last = false, fresh nonce)
-        if check_old_last {
-            let old_last = old_total_chunks - 1;
-            let mut plain = pre_decrypted.remove(&old_last).unwrap();
-            if plain.len() < CHUNK_PLAIN_SIZE {
-                plain.resize(CHUNK_PLAIN_SIZE, 0u8);
-            }
-            let cipher_chunk = self
-                .engine
-                .encrypt_chunk_v3(&file_id, old_last, false, &plain)
-                .map_err(|_| libc::EIO)?;
-
-            let cipher_offset = CryptoEngine::chunk_offset_to_cipher_offset_v3(old_last);
-            file.seek(SeekFrom::Start(cipher_offset))
-                .map_err(|e| io_err_to_errno(&e))?;
-            file.write_all(&cipher_chunk)
-                .map_err(|e| io_err_to_errno(&e))?;
-        }
-
-        // 7. Critical Step B: Fill sparse gap chunks with zeros (is_last = false, fresh nonce)
+        // 6. Step B: Fill sparse gap chunks with zeros (is_last = false, fresh nonce)
         if write_start_chunk > old_total_chunks {
             let zeros = vec![0u8; CHUNK_PLAIN_SIZE];
             for gap_idx in old_total_chunks..write_start_chunk {
@@ -1225,7 +1291,7 @@ impl FsInner {
             }
         }
 
-        // 8. Critical Step C: Write target chunks
+        // 7. Step C: Write target chunks
         for chunk_idx in write_start_chunk..=write_end_chunk {
             let chunk_plain_start = chunk_idx * (CHUNK_PLAIN_SIZE as u64);
             let chunk_plain_end = chunk_plain_start + (CHUNK_PLAIN_SIZE as u64);
@@ -1268,6 +1334,26 @@ impl FsInner {
             if new_end > raw_len {
                 raw_len = new_end;
             }
+        }
+
+        // 8. Step A (Crash-resilient finalization - K9):
+        // Update old last chunk only after all subsequent/gap chunks are safely on disk.
+        if check_old_last {
+            let old_last = old_total_chunks - 1;
+            let mut plain = pre_decrypted.remove(&old_last).unwrap();
+            if plain.len() < CHUNK_PLAIN_SIZE {
+                plain.resize(CHUNK_PLAIN_SIZE, 0u8);
+            }
+            let cipher_chunk = self
+                .engine
+                .encrypt_chunk_v3(&file_id, old_last, false, &plain)
+                .map_err(|_| libc::EIO)?;
+
+            let cipher_offset = CryptoEngine::chunk_offset_to_cipher_offset_v3(old_last);
+            file.seek(SeekFrom::Start(cipher_offset))
+                .map_err(|e| io_err_to_errno(&e))?;
+            file.write_all(&cipher_chunk)
+                .map_err(|e| io_err_to_errno(&e))?;
         }
 
         Ok(data.len())
@@ -1365,6 +1451,10 @@ impl FsInner {
                 .map_err(|e| io_err_to_errno(&e))?;
         } else {
             // Truncate up (extending)
+            if new_plain_size - old_plain_len > MAX_SPARSE_EXPANSION_BYTES {
+                return Err(libc::EFBIG);
+            }
+
             if old_total_chunks == 0 {
                 // Expanding from empty file (0 plaintext bytes)
                 let zeros = vec![0u8; CHUNK_PLAIN_SIZE];
@@ -1793,7 +1883,7 @@ impl FsInner {
         reply.ok();
     }
 
-    fn do_open(&self, ino: u64, _flags: i32, guard: ReplyGuard<ReplyOpen>) {
+    fn do_open(&self, ino: u64, flags: i32, guard: ReplyGuard<ReplyOpen>) {
         let path = match self.inodes.read().get_path(ino) {
             Some(p) => p,
             None => {
@@ -1814,9 +1904,11 @@ impl FsInner {
             }
         };
 
-        let file = match OpenOptions::new().read(true).write(true).open(&raw_path) {
-            Ok(f) => f,
-            Err(_) => match OpenOptions::new().read(true).open(&raw_path) {
+        let acc_mode = flags & libc::O_ACCMODE;
+        let want_write = acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR;
+
+        let file = if !want_write {
+            match OpenOptions::new().read(true).open(&raw_path) {
                 Ok(f) => f,
                 Err(err) => {
                     let errno = io_err_to_errno(&err);
@@ -1825,7 +1917,21 @@ impl FsInner {
                     }
                     return;
                 }
-            },
+            }
+        } else {
+            match OpenOptions::new().read(true).write(true).open(&raw_path) {
+                Ok(f) => f,
+                Err(_) => match OpenOptions::new().read(true).open(&raw_path) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        let errno = io_err_to_errno(&err);
+                        if let Some(r) = guard.take() {
+                            r.error(errno);
+                        }
+                        return;
+                    }
+                },
+            }
         };
 
         let fh = self.handles.insert(file);
@@ -1937,7 +2043,7 @@ impl FsInner {
         });
     }
 
-    fn do_create(&self, parent: u64, name: &str, guard: ReplyGuard<ReplyCreate>) {
+    fn do_create(&self, parent: u64, name: &str, flags: i32, guard: ReplyGuard<ReplyCreate>) {
         let parent_path = match self.inodes.read().get_path(parent) {
             Some(p) => p,
             None => {
@@ -1949,25 +2055,36 @@ impl FsInner {
         };
 
         let child_path = parent_path.join(name);
-        let raw_child = match self.to_raw_path(&child_path) {
-            Ok(p) => p,
-            Err(e) => {
-                if let Some(r) = guard.take() {
-                    r.error(e);
-                }
-                return;
-            }
-        };
 
         self.inode_locks.with_locks(&[parent], || {
+            let raw_child = match self.to_raw_path(&child_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(r) = guard.take() {
+                        r.error(e);
+                    }
+                    return;
+                }
+            };
+
             let (v3_header, _) = self.engine.create_v3_header();
-            let mut file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&raw_child)
-            {
+            let is_excl = (flags & libc::O_EXCL) != 0;
+            let open_res = if is_excl {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&raw_child)
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&raw_child)
+            };
+
+            let mut file = match open_res {
                 Ok(f) => f,
                 Err(err) => {
                     let errno = io_err_to_errno(&err);
@@ -2178,7 +2295,6 @@ impl FsInner {
                 }
             };
 
-            let dir_id = self.get_or_create_dir_id(&raw_child, &child_path, false).ok();
             let mut meta_files = Vec::new();
             let mut has_user_files = false;
 
@@ -2197,37 +2313,25 @@ impl FsInner {
                 let file_name = entry.file_name();
                 let file_name_str = file_name.to_string_lossy();
                 if file_name_str == DIRIV_FILENAME
+                    || file_name_str == VAULT_META_FILENAME
                     || file_name_str == ".nomedia"
                     || file_name_str == ".directory"
                     || file_name_str.starts_with(".aksync_diriv.tmp.")
-                    || is_longname_sidecar(&file_name_str)
                 {
                     meta_files.push(entry.path());
-                } else {
-                    let is_valid_user_file = if is_longname_file(&file_name_str) {
-                        let sidecar_path = raw_child.join(longname_sidecar_for(&file_name_str));
-                        match fs::read_to_string(&sidecar_path) {
-                            Ok(sidecar_content) => {
-                                let enc_name = sidecar_content.trim();
-                                if hash_long_cipher_name(enc_name) == file_name_str {
-                                    decrypt_filename(&self.engine, enc_name, dir_id.as_deref()).is_ok()
-                                } else {
-                                    false
-                                }
-                            }
-                            Err(_) => false,
-                        }
-                    } else {
-                        decrypt_filename(&self.engine, &file_name_str, dir_id.as_deref()).is_ok()
-                    };
-
-                    if is_valid_user_file {
+                } else if is_longname_sidecar(&file_name_str) {
+                    let main_file_name = file_name_str.trim_end_matches(LONGNAME_SUFFIX);
+                    let main_file_path = raw_child.join(main_file_name);
+                    if main_file_path.exists() {
                         has_user_files = true;
                         break;
                     } else {
-                        // Orphan/corrupted leftover file unreadable by user readdir
                         meta_files.push(entry.path());
                     }
+                } else {
+                    // Any other file or subdirectory is real user data (whether decryptable or not)
+                    has_user_files = true;
+                    break;
                 }
             }
 
@@ -2238,26 +2342,20 @@ impl FsInner {
                 return;
             }
 
+            // Only remove known metadata files
             for meta in meta_files {
-                if meta.is_dir() {
-                    let _ = fs::remove_dir_all(&meta);
-                } else {
-                    let _ = fs::remove_file(&meta);
-                }
+                let _ = fs::remove_file(&meta);
             }
 
             let mut remove_res = fs::remove_dir(&raw_child);
             if remove_res.is_err() {
-                for i in 0..5 {
-                    std::thread::sleep(Duration::from_millis(150));
+                for _ in 0..3 {
+                    std::thread::sleep(Duration::from_millis(100));
                     remove_res = fs::remove_dir(&raw_child);
                     if remove_res.is_ok()
                         || remove_res.as_ref().err().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound)
                     {
                         break;
-                    }
-                    if i == 4 {
-                        remove_res = fs::remove_dir_all(&raw_child);
                     }
                 }
             }
@@ -2287,6 +2385,7 @@ impl FsInner {
         name: &str,
         newparent: u64,
         newname: &str,
+        flags: u32,
         guard: ReplyGuard<ReplyEmpty>,
     ) {
         let parent_path = match self.inodes.read().get_path(parent) {
@@ -2337,21 +2436,91 @@ impl FsInner {
             }
         };
 
-        self.inode_locks.with_locks(&[parent, newparent], || {
-            if let Err(err) = fs::rename(&raw_old, &raw_new) {
-                let errno = io_err_to_errno(&err);
+        if flags != 0 {
+            #[cfg(target_os = "linux")]
+            {
+                let noreplace = libc::RENAME_NOREPLACE;
+                if (flags & !noreplace) != 0 {
+                    if let Some(r) = guard.take() {
+                        r.error(libc::EINVAL);
+                    }
+                    return;
+                }
+                if (flags & noreplace) != 0 && raw_new.exists() {
+                    if let Some(r) = guard.take() {
+                        r.error(libc::EEXIST);
+                    }
+                    return;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
                 if let Some(r) = guard.take() {
-                    r.error(errno);
+                    r.error(libc::EINVAL);
+                }
+                return;
+            }
+        }
+
+        self.inode_locks.with_locks(&[parent, newparent], || {
+            #[cfg(target_os = "linux")]
+            if flags != 0 && (flags & libc::RENAME_NOREPLACE) != 0 && raw_new.exists() {
+                if let Some(r) = guard.take() {
+                    r.error(libc::EEXIST);
                 }
                 return;
             }
 
-            self.remove_longname_sidecar_if_any(&raw_old);
-            let raw_new_parent = match raw_new.parent() {
-                Some(p) => p,
-                None => &self.raw_root,
-            };
-            let _ = self.write_longname_sidecar_if_needed(raw_new_parent, &newparent_path, newname);
+            let is_symlink = fs::symlink_metadata(&raw_old)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+
+            if is_symlink && parent != newparent {
+                // O2: Symlinks are cryptographically bound to parent directory via AAD (dir_id).
+                // Re-encrypt symlink under new parent directory's dir_id.
+                let plain_target = match self.read_symlink(&old_child) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if let Some(r) = guard.take() {
+                            r.error(e);
+                        }
+                        return;
+                    }
+                };
+
+                if let Err(e) = self.create_symlink(&newparent_path, newname, &plain_target) {
+                    if let Some(r) = guard.take() {
+                        r.error(e);
+                    }
+                    return;
+                }
+
+                let _ = fs::remove_file(&raw_old);
+                self.remove_longname_sidecar_if_any(&raw_old);
+            } else {
+                if let Err(err) = fs::rename(&raw_old, &raw_new) {
+                    let errno = io_err_to_errno(&err);
+                    if let Some(r) = guard.take() {
+                        r.error(errno);
+                    }
+                    return;
+                }
+
+                let raw_new_parent = match raw_new.parent() {
+                    Some(p) => p,
+                    None => &self.raw_root,
+                };
+                if let Err(errno) = self.write_longname_sidecar_if_needed(raw_new_parent, &newparent_path, newname) {
+                    // O3: Rollback rename if sidecar creation fails
+                    let _ = fs::rename(&raw_new, &raw_old);
+                    if let Some(r) = guard.take() {
+                        r.error(errno);
+                    }
+                    return;
+                }
+
+                self.remove_longname_sidecar_if_any(&raw_old);
+            }
 
             self.inodes.write().rename(&old_child, new_child.clone());
             {
@@ -2773,7 +2942,7 @@ impl EncryptedFs {
     ) -> Self {
         let health = RawMountHealth::new(raw_root.clone(), raw_fstype_check);
         let timeout_scheduler = TimeoutScheduler::new();
-        let worker_pool = WorkerPool::new(8, 64);
+        let worker_pool = WorkerPool::new(8, 256);
         let inner = Arc::new(FsInner {
             engine,
             raw_root,
@@ -2781,6 +2950,7 @@ impl EncryptedFs {
             health,
             handles: HandleTable::new(),
             inode_locks: InodeLocks::new(),
+            diriv_create_lock: parking_lot::Mutex::new(()),
             worker_pool,
             timeout_scheduler,
             op_timeout_secs,
@@ -2953,7 +3123,7 @@ impl Filesystem for EncryptedFs {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = match name.to_str() {
@@ -2965,7 +3135,7 @@ impl Filesystem for EncryptedFs {
         };
 
         self.inner.dispatch(reply, move |guard, inner| {
-            inner.do_create(parent, &name_str, guard);
+            inner.do_create(parent, &name_str, flags, guard);
         });
     }
 
@@ -3026,7 +3196,7 @@ impl Filesystem for EncryptedFs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         let name_str = match name.to_str() {
@@ -3045,7 +3215,7 @@ impl Filesystem for EncryptedFs {
         };
 
         self.inner.dispatch(reply, move |guard, inner| {
-            inner.do_rename(parent, &name_str, newparent, &newname_str, guard);
+            inner.do_rename(parent, &name_str, newparent, &newname_str, flags, guard);
         });
     }
 
@@ -4121,6 +4291,53 @@ mod tests {
         let sidecar_err =
             fs_inst.write_longname_sidecar_if_needed(&temp_dir, Path::new(""), &too_long_name);
         assert_eq!(sidecar_err, Err(libc::ENAMETOOLONG));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_corrupted_diriv_returns_eio_and_preserves_file() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_corrupt_diriv_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0x91; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+
+        // Create a corrupted .aksync_diriv file (tampered tag)
+        let diriv_path = temp_dir.join(DIRIV_FILENAME);
+        let mut corrupted_hdr = [0x55u8; HEADER_SIZE_V3];
+        corrupted_hdr[0..4].copy_from_slice(MAGIC_V3);
+        corrupted_hdr[4] = 3;
+        fs::write(&diriv_path, corrupted_hdr).unwrap();
+
+        let res = fs_inst.inner.get_or_create_dir_id(&temp_dir, Path::new(""), true);
+        assert_eq!(res, Err(libc::EIO), "Corrupted .aksync_diriv must return EIO and never be deleted");
+        assert!(diriv_path.exists(), ".aksync_diriv must not be removed on verification failure");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_excessive_sparse_write_returns_efbig() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_excessive_sparse_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0x92; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+        let raw_file = temp_dir.join("huge_sparse.bin");
+
+        // Attempting to write at 300 MiB offset from empty file (> 256 MiB limit)
+        let offset = 300 * 1024 * 1024;
+        let res = fs_inst.write_payload(&raw_file, offset, b"data");
+        assert_eq!(res, Err(libc::EFBIG), "Excessive sparse write must return EFBIG");
+
+        // Attempting to truncate to 300 MiB (> 256 MiB limit)
+        let trunc_res = fs_inst.truncate_file(&raw_file, offset);
+        assert_eq!(trunc_res, Err(libc::EFBIG), "Excessive truncate must return EFBIG");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

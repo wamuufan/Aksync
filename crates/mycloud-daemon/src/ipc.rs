@@ -388,7 +388,7 @@ impl IpcServer {
                         let rc_pass = state.rc_pass.clone();
                         tokio::spawn(async move {
                             let _ = sync_state.send(SyncState::Syncing);
-                            let _ = crate::home_sync::execute_home_sync(
+                            match crate::home_sync::execute_home_sync(
                                 &rclone_bin,
                                 &target_mount_path,
                                 &selected,
@@ -399,8 +399,18 @@ impl IpcServer {
                                 &rc_user,
                                 &rc_pass,
                             )
-                            .await;
-                            let _ = sync_state.send(SyncState::Idle);
+                            .await {
+                                Ok(()) => {
+                                    if *sync_state.borrow() == SyncState::Syncing {
+                                        let _ = sync_state.send(SyncState::Idle);
+                                    }
+                                }
+                                Err(err) => {
+                                    if *sync_state.borrow() == SyncState::Syncing {
+                                        let _ = sync_state.send(SyncState::Error(err));
+                                    }
+                                }
+                            }
                         });
                     }
 
@@ -643,7 +653,7 @@ impl IpcServer {
                             let rc_pass = state.rc_pass.clone();
                             tokio::spawn(async move {
                                 let _ = sync_state.send(SyncState::Syncing);
-                                let _ = crate::home_sync::execute_home_sync(
+                                match crate::home_sync::execute_home_sync(
                                     &rclone_bin,
                                     &target_mount_path,
                                     &selected,
@@ -654,8 +664,18 @@ impl IpcServer {
                                     &rc_user,
                                     &rc_pass,
                                 )
-                                .await;
-                                let _ = sync_state.send(SyncState::Idle);
+                                .await {
+                                    Ok(()) => {
+                                        if *sync_state.borrow() == SyncState::Syncing {
+                                            let _ = sync_state.send(SyncState::Idle);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if *sync_state.borrow() == SyncState::Syncing {
+                                            let _ = sync_state.send(SyncState::Error(err));
+                                        }
+                                    }
+                                }
                             });
                             IpcResponse::Ok("Sync triggered".to_string())
                         }
@@ -703,19 +723,19 @@ impl IpcServer {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp_path = format!("/tmp/.aksync_vault_{}_{}.json", pid, rand_val);
+        let meta_tmp_dir = crate::process::expand_cache_dir("meta_tmp");
+        let _ = std::fs::create_dir_all(&meta_tmp_dir);
+        let tmp_path = meta_tmp_dir.join(format!(".aksync_vault_{}_{}.json", pid, rand_val));
 
-        let json_bytes = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
-        tokio::fs::write(&tmp_path, &json_bytes)
-            .await
-            .map_err(|e| e.to_string())?;
+        let json_str = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+        crate::process::write_file_atomic_0600(&tmp_path, &json_str).map_err(|e| e.to_string())?;
 
         info!("Uploading cloud vault metadata to '{}'", target_remote);
         let mut cmd = Command::new(&state.rclone_bin);
         cmd.arg("copyto").arg(&tmp_path).arg(&target_remote);
 
         let output_res = cmd.output().await;
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let _ = std::fs::remove_file(&tmp_path);
 
         match output_res {
             Ok(out) if out.status.success() => Ok(()),
@@ -980,6 +1000,13 @@ impl IpcServer {
         let clean_subpath = crate::process::get_remote_vault_path(&req.vault_name);
         let v_name = clean_subpath.trim_start_matches("Aksync/").to_string();
 
+        if state.rclone_bin != "true" && Self::fetch_cloud_vault_metadata(state, &v_name).await.is_ok() {
+            req.password.zeroize();
+            return IpcResponse::Err(
+                "A vault with this name already exists in Google Drive. Please choose a different name or recover the existing vault.".to_string(),
+            );
+        }
+
         let is_already_init = {
             let cfg = state.daemon_config.read().await;
             cfg.vault_initialized
@@ -1069,7 +1096,7 @@ impl IpcServer {
             vault_verification_tag: v_token.clone(),
         };
         if let Err(e) = Self::upload_vault_metadata(state, &v_name, &meta).await {
-            warn!("Failed to upload cloud vault metadata: {}", e);
+            return IpcResponse::Err(format!("Failed to upload cloud vault metadata: {e}"));
         }
 
         let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
@@ -1093,10 +1120,7 @@ impl IpcServer {
 
         {
             let mut guard = state.master_key.write().await;
-            *guard = Some(dmk);
-            if let Some(ref k) = *guard {
-                mlock_key_slice(k);
-            }
+            *guard = None;
         }
 
         let _ = state.sync_state.send(SyncState::Locked);
@@ -1204,7 +1228,7 @@ impl IpcServer {
             vault_verification_tag: v_token.clone(),
         };
         if let Err(e) = Self::upload_vault_metadata(state, &vault_name, &meta).await {
-            warn!("Failed to upload cloud vault metadata: {}", e);
+            return IpcResponse::Err(format!("Failed to upload cloud vault metadata: {e}"));
         }
         let _is_complete = {
             let mut cfg = state.daemon_config.write().await;
@@ -1226,10 +1250,7 @@ impl IpcServer {
 
         {
             let mut guard = state.master_key.write().await;
-            *guard = Some(dmk);
-            if let Some(ref k) = *guard {
-                mlock_key_slice(k);
-            }
+            *guard = None;
         }
 
         let _ = state.sync_state.send(SyncState::Locked);
@@ -1507,7 +1528,8 @@ impl IpcServer {
             }
         }
 
-        {
+        let current_sync = state.sync_state.borrow().clone();
+        if !matches!(current_sync, SyncState::Locked | SyncState::SetupRequired) {
             let mut guard = state.master_key.write().await;
             *guard = Some(dmk);
             if let Some(ref k) = *guard {
@@ -1775,8 +1797,8 @@ mod tests {
             _ => panic!("Expected Ok response, got {:?}", init_resp),
         }
 
-        // Verify master key was derived in memory
-        assert!(shared_state.master_key.read().await.is_some());
+        // Verify master key is cleared on initialization (vault remains Locked until unlocked)
+        assert!(shared_state.master_key.read().await.is_none());
 
         // Check socket permissions (0o600)
         #[cfg(unix)]
@@ -1832,6 +1854,8 @@ mod tests {
             IpcResponse::Ok(msg) => assert!(msg.contains("Vault unlocked")),
             _ => panic!("Expected Ok response, got {:?}", unlock_resp),
         }
+
+        assert!(shared_state.master_key.read().await.is_some());
 
         // Test 4: State guards under Locked/Error states
         let _ = shared_state.sync_state.send(SyncState::Locked);
@@ -1955,6 +1979,20 @@ mod tests {
             _ => panic!("Expected Ok response from InitializeVault, got {:?}", init_resp),
         };
         assert_eq!(recovery_key.len(), 52);
+        assert!(shared_state.master_key.read().await.is_none());
+
+        // Unlock vault to load master key into memory
+        let unlock_req = serde_json::to_string(&IpcCommand::UnlockVault("supersecret123".to_string())).unwrap() + "\n";
+        writer.write_all(unlock_req.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        response_line.clear();
+        buf_reader.read_line(&mut response_line).await.unwrap();
+        let unlock_resp: IpcResponse = serde_json::from_str(response_line.trim()).unwrap();
+        match unlock_resp {
+            IpcResponse::Ok(msg) => assert!(msg.contains("Vault unlocked")),
+            _ => panic!("Expected Ok response from UnlockVault, got {:?}", unlock_resp),
+        }
 
         // Record DMK before changes
         let dmk_before = shared_state.master_key.read().await.as_ref().unwrap().clone();

@@ -3,17 +3,19 @@ use crate::tauri_bridge;
 use leptos::*;
 
 fn copy_text_to_clipboard(text: &str) {
-    let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let Ok(js_str) = serde_json::to_string(text) else {
+        return;
+    };
     let js_code = format!(
-        r#"(function() {{
+        r#"(function(val) {{
             try {{
                 if (navigator.clipboard && navigator.clipboard.writeText) {{
-                    navigator.clipboard.writeText('{0}');
+                    navigator.clipboard.writeText(val);
                 }}
             }} catch (e) {{}}
             try {{
                 var el = document.createElement('textarea');
-                el.value = '{0}';
+                el.value = val;
                 el.setAttribute('readonly', '');
                 el.style.position = 'fixed';
                 el.style.left = '-9999px';
@@ -22,8 +24,7 @@ fn copy_text_to_clipboard(text: &str) {
                 document.execCommand('copy');
                 document.body.removeChild(el);
             }} catch (e) {{}}
-        }})()"#,
-        escaped
+        }})({js_str})"#
     );
     let _ = js_sys::eval(&js_code);
 }
@@ -100,6 +101,7 @@ where
     let (generated_recovery_key, set_generated_recovery_key) = create_signal(String::new());
     let (recovery_countdown, set_recovery_countdown) = create_signal(0u8);
     let (step3_unlocking, set_step3_unlocking) = create_signal(false);
+    let (step3_error, set_step3_error) = create_signal(Option::<String>::None);
     let (key_copied, set_key_copied) = create_signal(false);
 
     // Step 1: Connect to Google Drive OAuth
@@ -207,6 +209,17 @@ where
             set_step2_create_error.set(Some(lang.get().wizard_vault_name_empty().to_string()));
             return;
         }
+
+        let vault_exists_remotely = remote_vaults
+            .get()
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&v_name));
+        if vault_exists_remotely {
+            let err_msg = lang.get().translate_error("A vault with this name already exists in Google Drive. Please choose a different name or recover the existing vault.");
+            set_step2_create_error.set(Some(err_msg));
+            return;
+        }
+
         if pw.len() < 8 {
             set_step2_create_error.set(Some(lang.get().wizard_pw_short().to_string()));
             return;
@@ -240,7 +253,7 @@ where
                 }
                 Err(e) => {
                     set_step2_create_loading.set(false);
-                    set_step2_create_error.set(Some(e));
+                    set_step2_create_error.set(Some(lang.get().translate_error(&e)));
                 }
             }
         });
@@ -250,11 +263,19 @@ where
     let on_finish_step3 = move |_| {
         if recovery_countdown.get() == 0 && !step3_unlocking.get() {
             set_step3_unlocking.set(true);
+            set_step3_error.set(None);
             let pw = password.get();
             leptos::spawn_local(async move {
-                let _ = tauri_bridge::unlock_vault(pw).await;
-                set_step3_unlocking.set(false);
-                on_setup_finished();
+                match tauri_bridge::unlock_vault(pw).await {
+                    Ok(_) => {
+                        set_step3_unlocking.set(false);
+                        on_setup_finished();
+                    }
+                    Err(e) => {
+                        set_step3_unlocking.set(false);
+                        set_step3_error.set(Some(lang.get().translate_error(&e)));
+                    }
+                }
             });
         }
     };
@@ -848,6 +869,14 @@ where
                             }
                         }}
                     </button>
+
+                    {move || step3_error.get().map(|err| {
+                        view! {
+                            <div class="wizard-status-msg wizard-msg-error" style="margin-top: 0.6rem;">
+                                {err}
+                            </div>
+                        }
+                    })}
                 </div>
             </div>
         </div>

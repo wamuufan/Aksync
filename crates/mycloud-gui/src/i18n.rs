@@ -963,7 +963,9 @@ impl Language {
         let clean = err.trim();
         match self {
             Self::Turkish => {
-                if clean.contains("Invalid master password") {
+                if clean.contains("already exists in Google Drive") {
+                    "Bu isimde bir kasa Google Drive'da zaten mevcut. Lütfen farklı bir kasa adı seçin veya mevcut kasayı kurtarın.".to_string()
+                } else if clean.contains("Invalid master password") {
                     "Geçersiz ana şifre. Lütfen şifrenizi kontrol edin.".to_string()
                 } else if clean.contains("Invalid recovery key") {
                     "Geçersiz kurtarma anahtarı.".to_string()
@@ -978,7 +980,9 @@ impl Language {
                 }
             }
             Self::English => {
-                if clean.contains("Invalid master password") {
+                if clean.contains("already exists in Google Drive") {
+                    "A vault with this name already exists in Google Drive. Please choose a different name or recover the existing vault.".to_string()
+                } else if clean.contains("Invalid master password") {
                     "Invalid master password. Please check your password.".to_string()
                 } else if clean.contains("Invalid recovery key") {
                     "Invalid recovery key.".to_string()

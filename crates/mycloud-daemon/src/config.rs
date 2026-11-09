@@ -19,6 +19,10 @@ fn default_vault_name() -> String {
     "Vault".to_string()
 }
 
+fn default_rclone_remote() -> String {
+    "mycloud_drive".to_string()
+}
+
 /// Persistent daemon configuration stored in ~/.config/mycloud/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -27,18 +31,23 @@ pub struct DaemonConfig {
     pub vault_name: String,
 
     /// Remote name configured in rclone (default: "mycloud_drive")
+    #[serde(default = "default_rclone_remote")]
     pub rclone_remote: String,
 
     /// Whether rclone remote has been successfully authorized and configured
+    #[serde(default)]
     pub rclone_configured: bool,
 
     /// Base64 encoded Argon2id salt for vault master key derivation
+    #[serde(default)]
     pub vault_salt_base64: Option<String>,
 
     /// Whether the cryptographic vault has been initialized
+    #[serde(default)]
     pub vault_initialized: bool,
 
     /// Verification token (hex-encoded canary ciphertext) to check master password correctness on unlock
+    #[serde(default)]
     pub vault_verification_tag: Option<String>,
 
     /// Last known cached storage used bytes (persisted for instant 0ms GUI startup)
@@ -120,8 +129,20 @@ impl DaemonConfig {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
-        Ok(config)
+        match toml::from_str::<Self>(&content) {
+            Ok(config) => Ok(config),
+            Err(err) => {
+                let bak_path = path.with_extension("toml.bak");
+                let _ = std::fs::copy(path, &bak_path);
+                tracing::error!(
+                    "Failed to parse {:?}, backed up to {:?}: {}",
+                    path,
+                    bak_path,
+                    err
+                );
+                Err(ConfigError::TomlDe(err))
+            }
+        }
     }
 
     /// Saves the current configuration to disk atomically with 0o600 permissions
@@ -325,7 +346,7 @@ fn default_vfs_read_chunk_size_limit() -> String { "64M".to_string() }
 fn default_vfs_read_ahead() -> String { "128k".to_string() }
 fn default_buffer_size() -> String { "128k".to_string() }
 fn default_dir_cache_time() -> String { "24h".to_string() }
-fn default_attr_timeout() -> String { "24h".to_string() }
+fn default_attr_timeout() -> String { "5s".to_string() }
 fn default_poll_interval() -> String { "1m".to_string() }
 fn default_drive_pacer_min_sleep() -> String { "200ms".to_string() }
 fn default_drive_pacer_burst() -> u32 { 10 }
@@ -513,6 +534,7 @@ mod tests {
         assert_eq!(cfg.vfs.cache_mode, "writes");
         assert_eq!(cfg.vfs.cache_max_size, "1G");
         assert_eq!(cfg.cache.dir_cache_time, "24h");
+        assert_eq!(cfg.cache.attr_timeout, "5s");
         assert_eq!(cfg.network.drive_pacer_burst, 10);
         assert_eq!(cfg.sync.transfers, 4);
         assert_eq!(cfg.sync.home_sync_interval_secs, 30);
@@ -523,5 +545,21 @@ mod tests {
         assert_eq!(cfg.network.retries, 3);
         assert!(cfg.features.enable_vfs_prewarm);
         assert!(cfg.features.enable_freeze_prevention);
+    }
+
+    #[test]
+    fn test_corrupted_config_backup() {
+        let temp_dir = std::env::temp_dir().join(format!("mycloud_test_corrupt_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let config_path = temp_dir.join("config.toml");
+        let bak_path = temp_dir.join("config.toml.bak");
+
+        std::fs::write(&config_path, "invalid_toml = [").unwrap();
+        let res = DaemonConfig::load_from(&config_path);
+        assert!(res.is_err());
+        assert!(bak_path.exists(), "Corrupted config must be backed up to .bak");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

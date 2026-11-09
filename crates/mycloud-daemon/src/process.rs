@@ -70,8 +70,9 @@ pub fn unmount_path_lazy(path: &Path) {
 
 /// Kills any stale processes binding or matching the specified port/pattern
 pub fn cleanup_stale_port_processes(port_or_pattern: &str) {
+    let pattern = format!("rclone.*{}", port_or_pattern);
     let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", port_or_pattern])
+        .args(["-TERM", "-f", &pattern])
         .output();
 }
 
@@ -84,16 +85,13 @@ pub fn kill_stale_rclone_webdav() {
     cleanup_stale_rclone_oauth();
 }
 
-/// Kills any stale `rclone config` or `rclone authorize` processes holding OAuth port 53682
+/// Kills any stale `rclone config create` or `rclone authorize` processes holding OAuth port 53682
 pub fn cleanup_stale_rclone_oauth() {
     let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "rclone config"])
+        .args(["-TERM", "-f", "rclone config create"])
         .output();
     let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "rclone authorize"])
-        .output();
-    let _ = std::process::Command::new("fuser")
-        .args(["-k", "53682/tcp"])
+        .args(["-TERM", "-f", "rclone authorize"])
         .output();
 }
 
@@ -128,15 +126,44 @@ pub fn prepare_empty_mountpoint(path: &Path) -> Result<(), std::io::Error> {
         return Ok(());
     }
 
-    // 4. Safe to clean stale unmounted files (like leftover .nomedia, .directory)
+    // 4. Safe to clean stale unmounted files or quarantine unexpected leftover files
     if let Ok(entries) = std::fs::read_dir(path) {
+        let mut quarantine_dir_opt: Option<PathBuf> = None;
         for entry in entries.flatten() {
             let child = entry.path();
-            info!("Removing stale file from unmounted mount point {:?}: {:?}", path, child);
-            if child.is_dir() {
-                let _ = std::fs::remove_dir_all(&child);
-            } else {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str == ".nomedia"
+                || file_name_str == ".directory"
+                || file_name_str == ".aksync_diriv"
+                || file_name_str == ".aksync_vault.json"
+            {
+                info!("Removing harmless marker file from unmounted mount point {:?}: {:?}", path, child);
                 let _ = std::fs::remove_file(&child);
+            } else {
+                let q_dir = match &quarantine_dir_opt {
+                    Some(dir) => dir.clone(),
+                    None => {
+                        let sec = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let sub = format!("recovery_{}_{}", std::process::id(), sec);
+                        let q = expand_cache_dir("unmounted_recovery").join(sub);
+                        let _ = std::fs::create_dir_all(&q);
+                        quarantine_dir_opt = Some(q.clone());
+                        q
+                    }
+                };
+                let dest = q_dir.join(&file_name);
+                warn!(
+                    "Moving unexpected file/dir from unmounted mountpoint {:?} to quarantine {:?}",
+                    child, dest
+                );
+                if std::fs::rename(&child, &dest).is_err() && child.is_dir() {
+                    let _ = std::fs::remove_dir(&child);
+                }
             }
         }
     }
@@ -297,10 +324,56 @@ pub fn get_gdrive_mount_path() -> PathBuf {
     }
 }
 
+/// Atomically writes content to path with 0o600 permissions using a .tmp sibling file
+pub fn write_file_atomic_0600(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let rand_val = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), rand_val));
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 fn remove_bookmarks_matching(content: &mut String, patterns: &[&str]) {
     let mut i = 0;
     while let Some(start_rel) = content[i..].find("<bookmark") {
         let block_start = i + start_rel;
+        let after_tag = block_start + "<bookmark".len();
+        if let Some(next_ch) = content[after_tag..].chars().next() {
+            if next_ch != ' ' && next_ch != '>' && next_ch != '\t' && next_ch != '\n' {
+                // E.g. "<bookmark:icon", skip this tag
+                i = after_tag;
+                continue;
+            }
+        }
         if let Some(end_rel) = content[block_start..].find("</bookmark>") {
             let block_end = block_start + end_rel + "</bookmark>".len();
             let final_end = if content[block_end..].starts_with('\n') {
@@ -325,24 +398,25 @@ fn remove_bookmarks_matching(content: &mut String, patterns: &[&str]) {
     }
 }
 
+fn is_mycloud_gtk_bookmark(line: &str) -> bool {
+    line.contains("/.local/share/mycloud/vault")
+        || line.contains("127.0.0.1:8765")
+        || line.contains("127.0.0.1:8766")
+}
+
 fn update_gtk_bookmarks() {
     if let Ok(home) = std::env::var("HOME") {
         let gtk_dir = PathBuf::from(&home).join(".config/gtk-3.0");
-        let _ = std::fs::create_dir_all(&gtk_dir);
         let bookmarks_path = gtk_dir.join("bookmarks");
         let existing = std::fs::read_to_string(&bookmarks_path).unwrap_or_default();
         let mut lines: Vec<String> = existing
             .lines()
-            .filter(|line| {
-                !line.contains("mycloud")
-                    && !line.ends_with("Google Drive")
-                    && !line.ends_with("MyCloud")
-            })
+            .filter(|line| !is_mycloud_gtk_bookmark(line))
             .map(|s| s.to_string())
             .collect();
         lines.push(format!("file://{}/.local/share/mycloud/vault MyCloud", home));
         let new_content = lines.join("\n") + "\n";
-        let _ = std::fs::write(&bookmarks_path, new_content);
+        let _ = write_file_atomic_0600(&bookmarks_path, &new_content);
     }
 }
 
@@ -353,25 +427,26 @@ fn remove_gtk_bookmarks() {
             if let Ok(existing) = std::fs::read_to_string(&bookmarks_path) {
                 let lines: Vec<&str> = existing
                     .lines()
-                    .filter(|line| {
-                        !line.contains("mycloud")
-                            && !line.ends_with("Google Drive")
-                            && !line.ends_with("MyCloud")
-                    })
+                    .filter(|line| !is_mycloud_gtk_bookmark(line))
                     .collect();
                 let new_content = if lines.is_empty() {
                     String::new()
                 } else {
                     lines.join("\n") + "\n"
                 };
-                let _ = std::fs::write(&bookmarks_path, new_content);
+                let _ = write_file_atomic_0600(&bookmarks_path, &new_content);
             }
         }
     }
 }
 
 /// Registers the WebDAV flat network drive and MyCloud Vault in KDE Dolphin Places cleanly under Uzak Konum
-pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr: &str) {
+pub fn update_kde_places(
+    webdav_user: &str,
+    webdav_addr: &str,
+    vault_webdav_addr: &str,
+    webdav_token: &str,
+) {
     if let Ok(home) = std::env::var("HOME") {
         let xbel_path = PathBuf::from(&home).join(".local/share/user-places.xbel");
         if !xbel_path.exists() {
@@ -379,7 +454,7 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                 let _ = std::fs::create_dir_all(parent);
             }
             let empty_template = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xbel>\n<xbel xmlns:bookmark=\"http://www.freedesktop.org/standards/desktop-bookmarks\" xmlns:kdepriv=\"http://www.kde.org/kdepriv\" xmlns:mime=\"http://www.freedesktop.org/standards/shared-mime-info\">\n</xbel>\n";
-            let _ = std::fs::write(&xbel_path, empty_template);
+            let _ = write_file_atomic_0600(&xbel_path, empty_template);
         }
 
         if let Ok(content) = std::fs::read_to_string(&xbel_path) {
@@ -425,6 +500,7 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                 "webdav://mycloud@127.0.0.1:8765",
                 "webdav://mycloud@127.0.0.1:8766",
                 "webdav://mycloud@",
+                "aksync_",
                 ".local/share/mycloud/gdrive",
                 ".local/share/mycloud/vault",
                 "<title>Google Drive</title>",
@@ -435,16 +511,29 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
             let gdrive_bind = ensure_localhost_addr(webdav_addr);
             let vault_bind = ensure_localhost_addr(vault_webdav_addr);
 
-            let gdrive_url = if webdav_user.is_empty() {
-                format!("webdav://{}/", gdrive_bind)
-            } else {
+            let has_pass = std::env::var("MYCLOUD_WEBDAV_PASS")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
+            let token = webdav_token.trim();
+            let gdrive_url = if has_pass && !webdav_user.is_empty() {
                 format!("webdav://{}@{}/", webdav_user, gdrive_bind)
+            } else if !token.is_empty() {
+                format!("webdav://{}/aksync_{}/", gdrive_bind, token)
+            } else if !webdav_user.is_empty() {
+                format!("webdav://{}@{}/", webdav_user, gdrive_bind)
+            } else {
+                format!("webdav://{}/", gdrive_bind)
             };
 
-            let vault_url = if webdav_user.is_empty() {
-                format!("webdav://{}/", vault_bind)
-            } else {
+            let vault_url = if has_pass && !webdav_user.is_empty() {
                 format!("webdav://{}@{}/", webdav_user, vault_bind)
+            } else if !token.is_empty() {
+                format!("webdav://{}/aksync_{}/", vault_bind, token)
+            } else if !webdav_user.is_empty() {
+                format!("webdav://{}@{}/", webdav_user, vault_bind)
+            } else {
+                format!("webdav://{}/", vault_bind)
             };
 
             let mut additions = String::new();
@@ -493,7 +582,7 @@ pub fn update_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
 
             if let Some(pos) = cleaned.rfind("</xbel>") {
                 cleaned.insert_str(pos, &additions);
-                let _ = std::fs::write(&xbel_path, cleaned);
+                let _ = write_file_atomic_0600(&xbel_path, &cleaned);
             }
         }
 
@@ -529,6 +618,7 @@ pub fn remove_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                     "webdav://127.0.0.1:8765/",
                     "webdav://127.0.0.1:8766/",
                     "webdav://mycloud@",
+                    "aksync_",
                     "mycloud-gdrive-webdav",
                     "mycloud-vault-webdav",
                     "mycloud-vault-storage",
@@ -539,7 +629,7 @@ pub fn remove_kde_places(webdav_user: &str, webdav_addr: &str, vault_webdav_addr
                 ];
 
                 remove_bookmarks_matching(&mut cleaned, &stale_patterns);
-                let _ = std::fs::write(&xbel_path, cleaned);
+                let _ = write_file_atomic_0600(&xbel_path, &cleaned);
             }
         }
 
@@ -848,8 +938,18 @@ impl ProcessManager {
         );
 
         let webdav_cache = expand_cache_dir("rclone_webdav_gdrive");
+        if self.config.webdav_pass.trim().is_empty() {
+            use rand::Rng;
+            self.config.webdav_pass = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+        }
+        let secret_subpath = format!("aksync_{}", self.config.webdav_pass.trim());
         let mut cmd = Command::new(&self.config.rclone_bin);
-        cmd.arg("serve")
+        cmd.env("RCLONE_BASEURL", &secret_subpath)
+            .arg("serve")
             .arg("webdav")
             .arg(&remote_spec)
             .arg("--addr")
@@ -926,7 +1026,12 @@ impl ProcessManager {
         } else {
             ""
         };
-        update_kde_places(user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+        update_kde_places(
+            user,
+            &self.config.webdav_addr,
+            &self.config.vault_webdav_addr,
+            &self.config.webdav_pass,
+        );
 
         Ok(pid)
     }
@@ -1375,9 +1480,19 @@ impl ProcessManager {
         }
         let vault_bind_addr = ensure_localhost_addr(&self.config.vault_webdav_addr);
         let vault_cache = expand_cache_dir("rclone_webdav_vault");
+        if self.config.webdav_pass.trim().is_empty() {
+            use rand::Rng;
+            self.config.webdav_pass = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+        }
+        let secret_subpath = format!("aksync_{}", self.config.webdav_pass.trim());
 
         let mut wcmd = Command::new(&self.config.rclone_bin);
-        wcmd.arg("serve")
+        wcmd.env("RCLONE_BASEURL", &secret_subpath)
+            .arg("serve")
             .arg("webdav")
             .arg(&self.config.target_mount_path)
             .arg("--addr")
@@ -1438,7 +1553,12 @@ impl ProcessManager {
         } else {
             ""
         };
-        update_kde_places(user, &self.config.webdav_addr, &self.config.vault_webdav_addr);
+        update_kde_places(
+            user,
+            &self.config.webdav_addr,
+            &self.config.vault_webdav_addr,
+            &self.config.webdav_pass,
+        );
         Ok(pid)
     }
 
@@ -1636,11 +1756,12 @@ impl ProcessManager {
                     libc::kill(pid as i32, libc::SIGTERM);
                 }
             }
+            let rclone_timeout = sigterm_timeout.max(Duration::from_secs(10));
             tokio::select! {
                 _ = rclone.wait() => {
                     info!("rclone exited cleanly");
                 }
-                _ = sleep(sigterm_timeout) => {
+                _ = sleep(rclone_timeout) => {
                     warn!("rclone did not exit within timeout, sending SIGKILL");
                     let _ = rclone.kill().await;
                 }
@@ -1840,5 +1961,47 @@ mod tests {
         assert!(xbel.contains("dummy_separator"));
         assert!(!xbel.contains("Google Drive"));
         assert!(!xbel.contains("MyCloud"));
+    }
+
+    #[test]
+    fn test_remove_bookmarks_matching_ignores_subtags() {
+        let mut xbel = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xbel>
+ <bookmark href="file:///home/user">
+  <title>Home</title>
+  <info>
+   <metadata owner="http://freedesktop.org">
+    <bookmark:icon name="folder-cloud"/>
+   </metadata>
+  </info>
+ </bookmark>
+</xbel>
+"#.to_string();
+
+        let stale_patterns = ["folder-cloud"];
+        remove_bookmarks_matching(&mut xbel, &stale_patterns);
+        // The bookmark should be removed cleanly because it matches pattern, but <bookmark:icon wasn't mistaken for <bookmark
+        assert!(!xbel.contains("file:///home/user"));
+    }
+
+    #[test]
+    fn test_write_file_atomic_0600() {
+        let temp_dir = std::env::temp_dir().join(format!("mycloud_test_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let target_file = temp_dir.join("test_file.txt");
+
+        write_file_atomic_0600(&target_file, "atomic content 123").expect("write atomic failed");
+        assert!(target_file.exists());
+        let read_back = std::fs::read_to_string(&target_file).expect("read back failed");
+        assert_eq!(read_back, "atomic content 123");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&target_file).expect("metadata failed");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

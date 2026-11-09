@@ -214,15 +214,22 @@ pub struct CryptoEngine {
     k_data: [u8; KEY_SIZE],
     k_hdr: [u8; KEY_SIZE],
     k_name: [u8; KEY_SIZE],
+    k_name_mac: [u8; KEY_SIZE],
     k_canary: [u8; KEY_SIZE],
 }
 
 impl CryptoEngine {
+    /// Derives a subkey from the master key using Blake2bMac512.
+    pub fn derive_subkey(master_key: &[u8; KEY_SIZE], context: &[u8]) -> [u8; KEY_SIZE] {
+        derive_subkey(master_key, context)
+    }
+
     /// Creates a new engine instance with the given 256-bit key and derives subkeys.
     pub fn from_key(master_key: [u8; KEY_SIZE]) -> Self {
         let k_data = derive_subkey(&master_key, b"aksync-v3-data");
         let k_hdr = derive_subkey(&master_key, b"aksync-v3-hdr");
         let k_name = derive_subkey(&master_key, b"aksync-v3-name");
+        let k_name_mac = Self::derive_subkey(&master_key, b"aksync-subkey-name-mac-v3");
         let k_canary = derive_subkey(&master_key, b"aksync-v3-canary");
 
         Self {
@@ -230,6 +237,7 @@ impl CryptoEngine {
             k_data,
             k_hdr,
             k_name,
+            k_name_mac,
             k_canary,
         }
     }
@@ -263,6 +271,11 @@ impl CryptoEngine {
     /// Returns a reference to the filename subkey (k_name).
     pub fn k_name(&self) -> &[u8; KEY_SIZE] {
         &self.k_name
+    }
+
+    /// Returns a reference to the filename MAC subkey (k_name_mac).
+    pub fn k_name_mac(&self) -> &[u8; KEY_SIZE] {
+        &self.k_name_mac
     }
 
     /// Returns a reference to the canary subkey (k_canary).
@@ -680,6 +693,7 @@ impl Drop for CryptoEngine {
         self.k_data.zeroize();
         self.k_hdr.zeroize();
         self.k_name.zeroize();
+        self.k_name_mac.zeroize();
         self.k_canary.zeroize();
     }
 }

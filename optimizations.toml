@@ -33,7 +33,7 @@ buffer_size = "128k"
 dir_cache_time = "24h"
 
 # Dosya özniteliklerinin (boyut, tarih) RAM'de geçerli kalma süresi.
-attr_timeout = "24h"
+attr_timeout = "5s"
 
 # Google Drive üzerindeki değişikliklerin taranma aralığı (Google Drive Changes API).
 poll_interval = "1m"

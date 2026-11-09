@@ -187,34 +187,44 @@ impl GuiState {
             return Err("Daemon socket does not exist (offline)".to_string());
         }
 
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| format!("Failed to connect to UDS: {e}"))?;
+        let timeout_dur = if cmd.contains("TriggerDriveAuth") {
+            std::time::Duration::from_secs(180)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
 
-        let (reader, mut writer) = stream.split();
-        let mut buf_reader = BufReader::new(reader);
+        tokio::time::timeout(timeout_dur, async {
+            let mut stream = UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|e| format!("Failed to connect to UDS: {e}"))?;
 
-        let mut command_line = cmd.to_string();
-        if !command_line.ends_with('\n') {
-            command_line.push('\n');
-        }
+            let (reader, mut writer) = stream.split();
+            let mut buf_reader = BufReader::new(reader);
 
-        writer
-            .write_all(command_line.as_bytes())
-            .await
-            .map_err(|e| format!("UDS write error: {e}"))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| format!("UDS flush error: {e}"))?;
+            let mut command_line = cmd.to_string();
+            if !command_line.ends_with('\n') {
+                command_line.push('\n');
+            }
 
-        let mut response = String::new();
-        buf_reader
-            .read_line(&mut response)
-            .await
-            .map_err(|e| format!("UDS read error: {e}"))?;
+            writer
+                .write_all(command_line.as_bytes())
+                .await
+                .map_err(|e| format!("UDS write error: {e}"))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| format!("UDS flush error: {e}"))?;
 
-        Ok(response.trim().to_string())
+            let mut response = String::new();
+            buf_reader
+                .read_line(&mut response)
+                .await
+                .map_err(|e| format!("UDS read error: {e}"))?;
+
+            Ok(response.trim().to_string())
+        })
+        .await
+        .map_err(|_| "Daemon IPC request timed out".to_string())?
     }
 }
 
@@ -249,8 +259,8 @@ pub mod commands {
                     state: SyncState::Offline,
                     rclone_pid: None,
                     fuse_pid: None,
-                    raw_mount_path: format!("{home}/.cache/mycloud/raw_mount"),
-                    target_mount_path: format!("{home}/MyCloud"),
+                    raw_mount_path: format!("{home}/.cache/mycloud/raw_vault"),
+                    target_mount_path: format!("{home}/.local/share/mycloud/vault"),
                 })
             }
         }
@@ -312,7 +322,7 @@ pub mod commands {
                     .map_err(|e| format!("JSON parse error: {e}"))?;
                 match parsed {
                     DaemonIpcResponse::Ok(msg) => {
-                        state.update_tray_state(&SyncState::Idle);
+                        state.update_tray_state(&SyncState::Locked);
                         Ok(msg)
                     }
                     DaemonIpcResponse::Err(e) => Err(e),
@@ -607,9 +617,33 @@ pub mod commands {
     pub async fn open_cloud_folder() -> Result<(), String> {
         let home = std::env::var("HOME").map_err(|e| e.to_string())?;
         let path = format!("{home}/.local/share/mycloud/vault");
-        if !std::path::Path::new(&path).exists() {
-            let _ = std::fs::create_dir_all(&path);
+        let target_path = std::path::Path::new(&path);
+
+        let is_mounted = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|info| {
+                info.lines().any(|line| {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() < 7 {
+                        return false;
+                    }
+                    let mp = parts[4].replace("\\040", " ");
+                    if std::path::Path::new(&mp) != target_path {
+                        return false;
+                    }
+                    if let Some(dash_idx) = parts.iter().position(|&p| p == "-") {
+                        if dash_idx + 1 < parts.len() {
+                            return parts[dash_idx + 1].starts_with("fuse");
+                        }
+                    }
+                    false
+                })
+            })
+            .unwrap_or(false);
+
+        if !is_mounted {
+            return Err("Encrypted vault is not mounted yet. Please unlock your vault first.".to_string());
         }
+
         std::process::Command::new("xdg-open")
             .arg(&path)
             .spawn()
@@ -1543,7 +1577,8 @@ mod tests {
 
     #[test]
     fn test_generate_and_save_cloud_icons() {
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("icons");
+        let base = std::env::temp_dir().join(format!("mycloud_test_icons_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
 
         // 32x32
         let rgba32 = render_breeze_cloudstatus_rgba(32, 32, true);
@@ -1562,5 +1597,6 @@ mod tests {
         image::save_buffer_with_format(base.join("icon.png"), &rgba512, 512, 512, image::ColorType::Rgba8, image::ImageFormat::Png).unwrap();
 
         println!("Successfully generated all cloudstatus icons in {:?}", base);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

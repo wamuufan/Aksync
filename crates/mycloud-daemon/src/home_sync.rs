@@ -171,6 +171,19 @@ pub async fn execute_home_sync(
         return Err("Encrypted vault is not mounted".to_string());
     }
 
+    if rclone_bin != "true" {
+        let is_mounted = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|info| crate::process::is_mountpoint_ready(&info, target_vault_path, "fuse"))
+            .unwrap_or(false);
+        if !is_mounted {
+            warn!(
+                "Target vault path {:?} is not an active FUSE mount in /proc/self/mountinfo. Aborting home sync to prevent writing plaintext to disk.",
+                target_vault_path
+            );
+            return Err("Encrypted vault FUSE filesystem is not actively mounted".to_string());
+        }
+    }
+
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let home_path = Path::new(&home);
     let vault_home_dir = target_vault_path.join("home");
@@ -211,6 +224,46 @@ pub async fn execute_home_sync(
         }
 
         let target_dir = vault_home_dir.join(rel_folder);
+
+        let source_has_entries = std::fs::read_dir(&source_dir)
+            .map(|mut it| {
+                it.any(|entry| {
+                    if let Ok(e) = entry {
+                        if !sync_hidden {
+                            !e.file_name().to_string_lossy().starts_with('.')
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                })
+            })
+            .unwrap_or(false);
+
+        let target_has_entries = target_dir.is_dir()
+            && std::fs::read_dir(&target_dir)
+                .map(|mut it| {
+                    it.any(|entry| {
+                        if let Ok(e) = entry {
+                            let name = e.file_name();
+                            let s = name.to_string_lossy();
+                            s != ".nomedia" && s != ".directory" && s != ".aksync_diriv"
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .unwrap_or(false);
+
+        if !source_has_entries && target_has_entries {
+            warn!(
+                "Source home folder {:?} is empty while vault target {:?} has existing files. Skipping rclone sync to prevent accidental mass deletion.",
+                source_dir, target_dir
+            );
+            continue;
+        }
+
         info!(
             "Syncing home folder {:?} -> {:?} (encrypted via FUSE, sync_hidden={})",
             source_dir, target_dir, sync_hidden
@@ -221,7 +274,9 @@ pub async fn execute_home_sync(
             .arg(&source_dir)
             .arg(&target_dir)
             .arg("--transfers")
-            .arg(transfers.to_string());
+            .arg(transfers.to_string())
+            .arg("--max-delete")
+            .arg("100");
 
         if !sync_hidden {
             cmd.arg("--exclude")

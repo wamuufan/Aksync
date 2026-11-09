@@ -446,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rc_pass_arg = rc_pass.clone();
                         tokio::spawn(async move {
                             let _ = sync_state.send(SyncState::Syncing);
-                            let _ = crate::home_sync::execute_home_sync(
+                            match crate::home_sync::execute_home_sync(
                                 &rclone_bin,
                                 &target_mount,
                                 &selected,
@@ -456,8 +456,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &opt.process.vault_rc_bind_addr,
                                 &rc_user_arg,
                                 &rc_pass_arg,
-                            ).await;
-                            let _ = sync_state.send(SyncState::Idle);
+                            ).await {
+                                Ok(()) => {
+                                    if *sync_state.borrow() == SyncState::Syncing {
+                                        let _ = sync_state.send(SyncState::Idle);
+                                    }
+                                }
+                                Err(err) => {
+                                    if *sync_state.borrow() == SyncState::Syncing {
+                                        let _ = sync_state.send(SyncState::Error(err));
+                                    }
+                                }
+                            }
                         });
                     }
                 }
@@ -587,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         process_manager.set_vault_name(vault_name);
                         *raw_mount_shared.write().await = process_manager.raw_mount_path().to_path_buf();
 
+                        let mut raw_mount_ok = true;
                         if !cli.skip_rclone {
                             if process_manager.webdav_pid().is_none() {
                                 if let Err(e) = process_manager.spawn_webdav().await {
@@ -605,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let retry_interval = Duration::from_millis(optimizations.network.rc_ready_retry_ms);
                                         if let Err(e) = process::wait_for_mount(&raw_mount, "fuse", mount_timeout, retry_interval).await {
                                             error!("Raw mount readiness check failed: {}", e);
+                                            raw_mount_ok = false;
                                             let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
                                         } else {
                                             if optimizations.features.enable_freeze_prevention {
@@ -615,13 +627,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Err(e) => {
                                         error!("Failed to spawn rclone: {}", e);
+                                        raw_mount_ok = false;
                                         let _ = sync_state_tx.send(SyncState::Error(e.to_string()));
                                     }
                                 }
                             }
                         }
-                        let rclone_running = cli.skip_rclone || process_manager.rclone_pid().is_some();
-                        if rclone_running {
+                        let rclone_ready = raw_mount_ok && (cli.skip_rclone || process_manager.rclone_pid().is_some());
+                        if rclone_ready {
                             match process_manager.spawn_fuse(&key).await {
                                 Ok(pid) => {
                                     *fuse_pid_shared.write().await = Some(pid);
@@ -643,7 +656,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let rc_pass_arg = rc_pass.clone();
                                         tokio::spawn(async move {
                                             let _ = sync_tx.send(SyncState::Syncing);
-                                            let _ = crate::home_sync::execute_home_sync(
+                                            match crate::home_sync::execute_home_sync(
                                                 &rclone_bin,
                                                 &target_mount,
                                                 &selected,
@@ -653,8 +666,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 &opt.process.vault_rc_bind_addr,
                                                 &rc_user_arg,
                                                 &rc_pass_arg,
-                                            ).await;
-                                            let _ = sync_tx.send(SyncState::Idle);
+                                            ).await {
+                                                Ok(()) => {
+                                                    if *sync_tx.borrow() == SyncState::Syncing {
+                                                        let _ = sync_tx.send(SyncState::Idle);
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    if *sync_tx.borrow() == SyncState::Syncing {
+                                                        let _ = sync_tx.send(SyncState::Error(err));
+                                                    }
+                                                }
+                                            }
                                         });
                                     }
                                 }
