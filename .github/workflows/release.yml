@@ -63,11 +63,15 @@ jobs:
       - name: Package Release Archive (aksync-linux-x86_64.tar.gz)
         run: |
           PKG_DIR="aksync-linux-x86_64"
-          mkdir -p "dist-pkg/${PKG_DIR}"
-          cp target/release/mycloud-daemon "dist-pkg/${PKG_DIR}/"
-          cp target/release/mycloud-fuse   "dist-pkg/${PKG_DIR}/"
-          cp target/release/mycloud-gui    "dist-pkg/${PKG_DIR}/"
-          cp LICENSE README.md INSTALLATION.md HOW-TO-BUILD.md "dist-pkg/${PKG_DIR}/"
+          mkdir -p "dist-pkg/${PKG_DIR}/Aksync-bin"
+          cp target/release/mycloud-daemon "dist-pkg/${PKG_DIR}/Aksync-bin/"
+          cp target/release/mycloud-fuse   "dist-pkg/${PKG_DIR}/Aksync-bin/"
+          cp target/release/mycloud-gui    "dist-pkg/${PKG_DIR}/Aksync-bin/"
+          cp scripts/aksync-launch.sh      "dist-pkg/${PKG_DIR}/Aksync-bin/"
+          cp scripts/uninstall.sh          "dist-pkg/${PKG_DIR}/Aksync-bin/"
+          cp scripts/install.sh            "dist-pkg/${PKG_DIR}/install.sh"
+          chmod +x "dist-pkg/${PKG_DIR}/install.sh" "dist-pkg/${PKG_DIR}/Aksync-bin/"*
+          cp LICENSE README.md INSTALLATION.md "dist-pkg/${PKG_DIR}/"
           tar -czvf aksync-linux-x86_64.tar.gz -C dist-pkg "${PKG_DIR}"
           sha256sum aksync-linux-x86_64.tar.gz > aksync-linux-x86_64.tar.gz.sha256
 

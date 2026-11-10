@@ -43,7 +43,7 @@ $XDG_RUNTIME_DIR/mycloud/raw_vault    ◄── [rclone mount] (VFS Cache Mode: 
        │
        │ (3. Observes ONLY opaque AKS3 ciphertext blocks & Base32 names; syncs to cloud)
        ▼
-[Google Drive (`MyCloud_<user>_<host>` remote vault)]
+[Google Drive (`Aksync/<Vault_Name>` remote vault)]
 ```
 
 ### Why This Separation of Concerns Matters
@@ -98,7 +98,7 @@ The cryptographic engine ([`crates/mycloud-crypto`](crates/mycloud-crypto)) impl
 | :--- | :--- | :--- |
 | **Key Derivation (KDF)** | `Argon2id` | Derives a 256-bit Key Encryption Key (`KEK`) from the user's master passphrase and a 128-bit random salt. |
 | **Envelope Encryption (DEK/KEK)** | `XChaCha20-Poly1305` | A randomly generated 256-bit Data Master Key (`DMK`) is wrapped (`wrapped_dmk`) under both the passphrase-derived `KEK` and a 52-character Base32 **Recovery Key**. Enables **instant (~0.01s) passphrase rotation** without re-encrypting stored files. |
-| **Subkey Domain Separation** | `BLAKE2b-MAC-512` | Derives four independent 256-bit subkeys from the `DMK`: `k_data` (chunk payload), `k_hdr` (header authentication), `k_name` (filenames & `DirIV`), and `k_canary` (vault verification token). |
+| **Subkey Domain Separation** | `BLAKE2b-MAC-512` | Derives five independent 256-bit subkeys from the `DMK`: `k_data` (chunk payload), `k_hdr` (header authentication), `k_name` (filenames & `DirIV`), `k_name_mac` (deterministic filename MAC / SIV authentication), and `k_canary` (vault verification token). |
 | **Authenticated File Header (64 B)** | `AKS3` + `BLAKE2b-256` | `Magic ("AKS3", 4 B)` + `Version (0x03, 1 B)` + `Flags (3 B)` + `Random FileID (24 B)` + `Keyed BLAKE2b-256 MAC (32 B)`. Verified in constant time. |
 | **Chunk AEAD (64 KiB Plaintext)** | `XChaCha20-Poly1305` | Each 64 KiB chunk is encrypted with a fresh 24-byte `OsRng` nonce and a 16-byte Poly1305 authentication tag (`65,576 B` on disk). Partial writes (*Read-Modify-Write*) always regenerate a fresh random chunk nonce. |
 | **Contextual AAD (33 B)** | Per-Chunk Binding | Every chunk's Poly1305 tag authenticates `file_id (24 B) \|\| LE64(chunk_index) (8 B) \|\| is_last (1 B)`. Defeats in-file block reordering, cross-file chunk splicing, and truncation attacks, returning `libc::EIO` on any mismatch. |
@@ -117,8 +117,7 @@ AkSync features a clean, edge-to-edge split-view native utility interface that a
 
 ## 5. Installation & Building from Source
 
-- 📦 **[Installation Guide (`INSTALLATION.md`)](./INSTALLATION.md)** — Instructions for installing prebuilt release archives.
-- 🛠️ **[Build Guide (`HOW-TO-BUILD.md`)](./HOW-TO-BUILD.md)** — System dependencies, `wasm32-unknown-unknown` / `trunk` setup, and building native release binaries from source.
+- 📦 **[Installation & Build Guide (`INSTALLATION.md`)](./INSTALLATION.md)** — Complete instructions for installing prebuilt release archives and building from source.
 
 ```bash
 # One-step production release build:
@@ -137,10 +136,12 @@ AkSync/
 │   ├── mycloud-daemon/        # Background orchestrator, Unix IPC server, rclone/WebDAV/KWallet/HomeSync supervisor
 │   └── mycloud-gui/           # Leptos (WASM) reactive frontend + src-tauri/ native desktop & system tray shell
 ├── scripts/
-│   └── build.sh               # Automated production build script (Trunk WASM + Cargo workspace release)
+│   ├── build.sh               # Automated production build script (Trunk WASM + Cargo workspace release)
+│   ├── install.sh             # Distribution package installer (openSUSE Tumbleweed dep setup & user install)
+│   ├── aksync-launch.sh       # Unified launcher wrapper (starts daemon + GUI, cleans up on exit)
+│   └── uninstall.sh           # Clean uninstaller script
 ├── optimizations.toml         # Compile-time embedded rclone VFS, caching, and network tuning parameters
-├── INSTALLATION.md            # End-user installation guide
-├── HOW-TO-BUILD.md            # Developer build instructions
+├── INSTALLATION.md            # Installation and source build instructions
 └── LICENSE                    # BSD 2-Clause Simplified License
 ```
 

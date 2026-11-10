@@ -36,6 +36,10 @@ __pycache__/
 *.dmg
 *.msi
 *.exe
+*.tar.gz
+*.tar.gz.sha256
+/dist-pkg/
+/Aksync-bin/
 
 # 5. Secrets, Credentials, OAuth Tokens & Cryptographic Keys (NEVER COMMIT)
 .env
