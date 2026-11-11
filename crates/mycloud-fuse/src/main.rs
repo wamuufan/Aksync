@@ -25,6 +25,7 @@ use mycloud_crypto::{
 };
 
 const VAULT_META_FILENAME: &str = ".aksync_vault.json";
+const TRASH_DIR_NAME: &str = "Trash";
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_SUPER_MAGIC: u64 = 0x65735546;
 const MAX_SPARSE_EXPANSION_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB sparse gap guard
@@ -912,6 +913,184 @@ impl FsInner {
             }
         }
         Ok(current_raw)
+    }
+
+    /// Returns true if the first normal path component is the Trash root directory.
+    fn is_in_trash(rel_path: &Path) -> bool {
+        rel_path.components().find_map(|c| match c {
+            std::path::Component::Normal(os_name) => Some(os_name),
+            _ => None,
+        }) == Some(OsStr::new(TRASH_DIR_NAME))
+    }
+
+    /// Returns true for internal, metadata, or temporary filenames that bypass Trash on unlink.
+    fn should_bypass_trash(name: &str) -> bool {
+        name == DIRIV_FILENAME
+            || name == VAULT_META_FILENAME
+            || name == ".nomedia"
+            || name == ".directory"
+            || name.starts_with(".aksync_")
+            || name.ends_with(".tmp")
+            || name.contains(".tmp.")
+            || name.ends_with(".part")
+    }
+
+    /// Walks each component of `rel_dir`, creating raw directories, initializing `.aksync_diriv`,
+    /// and writing `.name` sidecars where required.
+    fn ensure_rel_dir_chain(&self, rel_dir: &Path) -> Result<PathBuf, i32> {
+        let mut current_raw = self.raw_root.clone();
+        let mut current_rel = PathBuf::new();
+
+        fs::create_dir_all(&current_raw).map_err(|e| io_err_to_errno(&e))?;
+        self.get_or_create_dir_id(&current_raw, &current_rel, true)?;
+
+        for component in rel_dir.components() {
+            match component {
+                std::path::Component::Normal(os_name) => {
+                    let plain_str = os_name.to_str().ok_or(libc::EINVAL)?;
+                    if plain_str.len() > 255 {
+                        return Err(libc::ENAMETOOLONG);
+                    }
+                    if plain_str == DIRIV_FILENAME {
+                        return Err(libc::EACCES);
+                    }
+
+                    let parent_dir_id =
+                        self.get_or_create_dir_id(&current_raw, &current_rel, true)?;
+                    let enc_name = encrypt_filename(&self.engine, plain_str, Some(&parent_dir_id))
+                        .map_err(|_| libc::EIO)?;
+                    let raw_name = if enc_name.len() <= MAX_RAW_FILENAME_LEN {
+                        enc_name
+                    } else {
+                        hash_long_cipher_name(&enc_name)
+                    };
+
+                    let next_raw = current_raw.join(raw_name);
+                    let next_rel = current_rel.join(os_name);
+
+                    fs::create_dir_all(&next_raw).map_err(|e| io_err_to_errno(&e))?;
+                    self.get_or_create_dir_id(&next_raw, &next_rel, true)?;
+                    self.write_longname_sidecar_if_needed(&current_raw, &current_rel, plain_str)?;
+
+                    current_raw = next_raw;
+                    current_rel = next_rel;
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    current_raw.pop();
+                    current_rel.pop();
+                }
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            }
+        }
+
+        Ok(current_raw)
+    }
+
+    fn truncate_utf8_to_max_bytes(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    fn make_deleted_trash_filename(name: &str, unix_secs: u64, attempt: usize) -> String {
+        let tag = if attempt == 0 {
+            format!(".deleted-{}", unix_secs)
+        } else {
+            format!(".deleted-{}-{}", unix_secs, attempt)
+        };
+
+        let path = Path::new(name);
+        if let (Some(stem), Some(ext)) = (
+            path.file_stem().and_then(|s| s.to_str()),
+            path.extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| !e.is_empty()),
+        ) {
+            let suffix = format!("{}.{}", tag, ext);
+            let max_stem_bytes = 255usize.saturating_sub(suffix.len());
+            let truncated_stem = Self::truncate_utf8_to_max_bytes(stem, max_stem_bytes);
+            let candidate = format!("{}{}", truncated_stem, suffix);
+            if candidate.len() <= 255 {
+                return candidate;
+            }
+        }
+
+        let max_name_bytes = 255usize.saturating_sub(tag.len());
+        let truncated_name = Self::truncate_utf8_to_max_bytes(name, max_name_bytes);
+        format!("{}{}", truncated_name, tag)
+    }
+
+    fn resolve_trash_destination(
+        &self,
+        trash_parent_rel: &Path,
+        name: &str,
+    ) -> Result<(String, PathBuf), i32> {
+        let first_dest_rel = trash_parent_rel.join(name);
+        let first_raw_dest = self.to_raw_path(&first_dest_rel)?;
+
+        match fs::symlink_metadata(&first_raw_dest) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((name.to_string(), first_raw_dest));
+            }
+            Err(err) => return Err(io_err_to_errno(&err)),
+        }
+
+        let unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        for attempt in 0..1000 {
+            let candidate_name = Self::make_deleted_trash_filename(name, unix_secs, attempt);
+            let candidate_rel = trash_parent_rel.join(&candidate_name);
+            let candidate_raw = self.to_raw_path(&candidate_rel)?;
+            match fs::symlink_metadata(&candidate_raw) {
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((candidate_name, candidate_raw));
+                }
+                Err(err) => return Err(io_err_to_errno(&err)),
+            }
+        }
+
+        Err(libc::EEXIST)
+    }
+
+    /// Moves a regular file from its vault location into `Trash/<parent_path>/<name>` via zero-copy raw rename.
+    fn move_to_trash(
+        &self,
+        parent_path: &Path,
+        child_path: &Path,
+        name: &str,
+        raw_child: &Path,
+    ) -> Result<(), i32> {
+        let trash_parent_rel = Path::new(TRASH_DIR_NAME).join(parent_path);
+        let raw_trash_parent = self.ensure_rel_dir_chain(&trash_parent_rel)?;
+        let (final_trash_filename, raw_trash_dest) =
+            self.resolve_trash_destination(&trash_parent_rel, name)?;
+
+        // Format v3 content encryption is bound to the file header's internal file_id, not parent dir_id.
+        fs::rename(raw_child, &raw_trash_dest).map_err(|e| io_err_to_errno(&e))?;
+
+        if let Err(errno) = self.write_longname_sidecar_if_needed(
+            &raw_trash_parent,
+            &trash_parent_rel,
+            &final_trash_filename,
+        ) {
+            let _ = fs::rename(&raw_trash_dest, raw_child);
+            return Err(errno);
+        }
+
+        self.remove_longname_sidecar_if_any(raw_child);
+        self.inodes.write().remove(child_path);
+        Ok(())
     }
 
     /// Builds a FileAttr structure for a given inode and physical file metadata
@@ -2205,29 +2384,25 @@ impl FsInner {
         });
     }
 
-    fn do_unlink(&self, parent: u64, name: &str, guard: ReplyGuard<ReplyEmpty>) {
-        let parent_path = match self.inodes.read().get_path(parent) {
-            Some(p) => p,
-            None => {
-                if let Some(r) = guard.take() {
-                    r.error(libc::ENOENT);
-                }
-                return;
-            }
-        };
-
+    pub fn unlink_inner(&self, parent: u64, name: &str) -> Result<(), i32> {
+        let parent_path = self.inodes.read().get_path(parent).ok_or(libc::ENOENT)?;
         let child_path = parent_path.join(name);
-        let raw_child = match self.to_raw_path(&child_path) {
-            Ok(p) => p,
-            Err(e) => {
-                if let Some(r) = guard.take() {
-                    r.error(e);
-                }
-                return;
-            }
-        };
+        let raw_child = self.to_raw_path(&child_path)?;
 
         self.inode_locks.with_locks(&[parent], || {
+            let is_regular_file = match fs::symlink_metadata(&raw_child) {
+                Ok(meta) => meta.is_file(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => return Err(io_err_to_errno(&err)),
+            };
+
+            if !Self::is_in_trash(&child_path)
+                && !Self::should_bypass_trash(name)
+                && is_regular_file
+            {
+                return self.move_to_trash(&parent_path, &child_path, name, &raw_child);
+            }
+
             let mut remove_res = fs::remove_file(&raw_child);
             if let Err(ref err) = remove_res {
                 if err.kind() != std::io::ErrorKind::NotFound {
@@ -2235,7 +2410,8 @@ impl FsInner {
                         std::thread::sleep(Duration::from_millis(100));
                         remove_res = fs::remove_file(&raw_child);
                         if remove_res.is_ok()
-                            || remove_res.as_ref().err().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound)
+                            || remove_res.as_ref().err().map(|e| e.kind())
+                                == Some(std::io::ErrorKind::NotFound)
                         {
                             break;
                         }
@@ -2245,20 +2421,29 @@ impl FsInner {
 
             if let Err(err) = remove_res {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    let errno = io_err_to_errno(&err);
-                    if let Some(r) = guard.take() {
-                        r.error(errno);
-                    }
-                    return;
+                    return Err(io_err_to_errno(&err));
                 }
             }
 
             self.remove_longname_sidecar_if_any(&raw_child);
             self.inodes.write().remove(&child_path);
-            if let Some(r) = guard.take() {
-                r.ok();
+            Ok(())
+        })
+    }
+
+    fn do_unlink(&self, parent: u64, name: &str, guard: ReplyGuard<ReplyEmpty>) {
+        match self.unlink_inner(parent, name) {
+            Ok(()) => {
+                if let Some(r) = guard.take() {
+                    r.ok();
+                }
             }
-        });
+            Err(errno) => {
+                if let Some(r) = guard.take() {
+                    r.error(errno);
+                }
+            }
+        }
     }
 
     fn do_rmdir(&self, parent: u64, name: &str, guard: ReplyGuard<ReplyEmpty>) {
@@ -4338,6 +4523,234 @@ mod tests {
         // Attempting to truncate to 300 MiB (> 256 MiB limit)
         let trunc_res = fs_inst.truncate_file(&raw_file, offset);
         assert_eq!(trunc_res, Err(libc::EFBIG), "Excessive truncate must return EFBIG");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_trash_helpers_and_bypass() {
+        assert!(FsInner::is_in_trash(Path::new("Trash")));
+        assert!(FsInner::is_in_trash(Path::new("Trash/home/Belgeler/report.txt")));
+        assert!(FsInner::is_in_trash(Path::new("./Trash/report.txt")));
+        assert!(!FsInner::is_in_trash(Path::new("")));
+        assert!(!FsInner::is_in_trash(Path::new("home/Belgeler/report.txt")));
+        assert!(!FsInner::is_in_trash(Path::new("home/Trash/report.txt")));
+
+        assert!(FsInner::should_bypass_trash(DIRIV_FILENAME));
+        assert!(FsInner::should_bypass_trash(VAULT_META_FILENAME));
+        assert!(FsInner::should_bypass_trash(".nomedia"));
+        assert!(FsInner::should_bypass_trash(".directory"));
+        assert!(FsInner::should_bypass_trash(".aksync_sync_state"));
+        assert!(FsInner::should_bypass_trash("upload.tmp"));
+        assert!(FsInner::should_bypass_trash("file.tmp.12345"));
+        assert!(FsInner::should_bypass_trash("video.part"));
+        assert!(!FsInner::should_bypass_trash("report.txt"));
+        assert!(!FsInner::should_bypass_trash("archive.tar.gz"));
+    }
+
+    #[test]
+    fn test_unlink_moves_file_to_trash_preserving_content() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_trash_move_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0xA1; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+
+        let parent_rel = PathBuf::from("home/Belgeler");
+        fs_inst.inner.ensure_rel_dir_chain(&parent_rel).unwrap();
+        let parent_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(parent_rel.clone());
+
+        let file_rel = parent_rel.join("report.txt");
+        let raw_file = fs_inst.inner.to_raw_path(&file_rel).unwrap();
+        let payload = b"important quarterly report contents";
+        fs_inst.write_payload(&raw_file, 0, payload).unwrap();
+        let file_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(file_rel.clone());
+
+        fs_inst.inner.unlink_inner(parent_ino, "report.txt").unwrap();
+
+        assert!(!raw_file.exists(), "Original raw file must be moved out");
+        assert!(
+            fs_inst.inner.inodes.read().get_path(file_ino).is_none(),
+            "Unlinked file inode must be removed"
+        );
+
+        let trashed_rel = PathBuf::from("Trash/home/Belgeler/report.txt");
+        let raw_trashed = fs_inst.inner.to_raw_path(&trashed_rel).unwrap();
+        assert!(raw_trashed.exists(), "File must exist under Trash/home/Belgeler/report.txt");
+
+        let read_back = fs_inst.read_payload(&raw_trashed, 0, payload.len()).unwrap();
+        assert_eq!(read_back, payload);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unlink_inside_trash_permanently_deletes() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_trash_perm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0xA2; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+
+        let parent_rel = PathBuf::from("home/Belgeler");
+        fs_inst.inner.ensure_rel_dir_chain(&parent_rel).unwrap();
+        let parent_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(parent_rel.clone());
+
+        let file_rel = parent_rel.join("report.txt");
+        let raw_file = fs_inst.inner.to_raw_path(&file_rel).unwrap();
+        fs_inst.write_payload(&raw_file, 0, b"delete me twice").unwrap();
+
+        // First unlink moves it to Trash/home/Belgeler/report.txt
+        fs_inst.inner.unlink_inner(parent_ino, "report.txt").unwrap();
+
+        let trash_parent_rel = PathBuf::from("Trash/home/Belgeler");
+        let trash_file_rel = trash_parent_rel.join("report.txt");
+        let raw_trashed = fs_inst.inner.to_raw_path(&trash_file_rel).unwrap();
+        assert!(raw_trashed.exists());
+
+        // Second unlink inside Trash permanently deletes from raw storage
+        let trash_parent_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(trash_parent_rel);
+        fs_inst
+            .inner
+            .unlink_inner(trash_parent_ino, "report.txt")
+            .unwrap();
+
+        assert!(
+            !raw_trashed.exists(),
+            "Unlinking inside Trash must permanently delete raw file"
+        );
+        let double_trash_raw = fs_inst
+            .inner
+            .to_raw_path(Path::new("Trash/Trash/home/Belgeler/report.txt"))
+            .unwrap();
+        assert!(
+            !double_trash_raw.exists(),
+            "Unlinking inside Trash must not nest into Trash/Trash"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unlink_duplicate_filename_appends_deleted_suffix() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_trash_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0xA3; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+
+        let parent_rel = PathBuf::from("home/Belgeler");
+        fs_inst.inner.ensure_rel_dir_chain(&parent_rel).unwrap();
+        let parent_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(parent_rel.clone());
+
+        // First version
+        let file_rel = parent_rel.join("report.txt");
+        let raw_file_1 = fs_inst.inner.to_raw_path(&file_rel).unwrap();
+        let v1_payload = b"first report version";
+        fs_inst.write_payload(&raw_file_1, 0, v1_payload).unwrap();
+        fs_inst.inner.unlink_inner(parent_ino, "report.txt").unwrap();
+
+        // Second version with same filename
+        let raw_file_2 = fs_inst.inner.to_raw_path(&file_rel).unwrap();
+        let v2_payload = b"second report version";
+        fs_inst.write_payload(&raw_file_2, 0, v2_payload).unwrap();
+        fs_inst.inner.unlink_inner(parent_ino, "report.txt").unwrap();
+
+        let trash_parent_rel = PathBuf::from("Trash/home/Belgeler");
+        let raw_trash_parent = fs_inst.inner.to_raw_path(&trash_parent_rel).unwrap();
+        let trash_dir_id = fs_inst
+            .inner
+            .get_or_create_dir_id(&raw_trash_parent, &trash_parent_rel, false)
+            .unwrap();
+
+        let mut decrypted_files: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in fs::read_dir(&raw_trash_parent).unwrap() {
+            let entry = entry.unwrap();
+            let raw_name = entry.file_name().into_string().unwrap();
+            if raw_name == DIRIV_FILENAME || is_longname_sidecar(&raw_name) {
+                continue;
+            }
+            let plain_name = decrypt_filename(&fs_inst.inner.engine, &raw_name, Some(&trash_dir_id))
+                .unwrap();
+            let content = fs_inst.read_payload(&entry.path(), 0, 1024).unwrap();
+            decrypted_files.push((plain_name, content));
+        }
+
+        assert_eq!(decrypted_files.len(), 2, "Both trashed versions must be preserved");
+        assert!(
+            decrypted_files
+                .iter()
+                .any(|(name, data)| name == "report.txt" && data.as_slice() == v1_payload),
+            "First trashed file must remain intact as report.txt"
+        );
+        assert!(
+            decrypted_files.iter().any(|(name, data)| {
+                name.starts_with("report.deleted-")
+                    && name.ends_with(".txt")
+                    && data.as_slice() == v2_payload
+            }),
+            "Second trashed file must have a .deleted-<timestamp>.txt suffix and intact contents"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unlink_bypass_temp_file_permanently_deletes() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("mycloud_test_trash_bypass_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let engine = CryptoEngine::from_key([0xA4; 32]);
+        let fs_inst = EncryptedFs::new_for_test(engine, temp_dir.clone());
+
+        let parent_rel = PathBuf::from("home");
+        fs_inst.inner.ensure_rel_dir_chain(&parent_rel).unwrap();
+        let parent_ino = fs_inst
+            .inner
+            .inodes
+            .write()
+            .get_or_insert_ino(parent_rel.clone());
+
+        let tmp_rel = parent_rel.join("upload.tmp");
+        let raw_tmp = fs_inst.inner.to_raw_path(&tmp_rel).unwrap();
+        fs_inst.write_payload(&raw_tmp, 0, b"temporary data").unwrap();
+
+        fs_inst.inner.unlink_inner(parent_ino, "upload.tmp").unwrap();
+
+        assert!(!raw_tmp.exists(), "Temp file must be permanently deleted");
+        let trash_raw = fs_inst
+            .inner
+            .to_raw_path(Path::new("Trash/home/upload.tmp"))
+            .unwrap();
+        assert!(!trash_raw.exists(), "Temp file must not be moved to Trash");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
